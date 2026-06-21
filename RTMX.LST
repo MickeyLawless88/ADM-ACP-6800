@@ -1,0 +1,806 @@
+ASSEMBLY LISTING - SOURCE FILE RTMX.ASM
+
+ADDR  CODE        LINE  SOURCE STATEMENT
+----  ----------  ----  ----------------
+0000                  2  ; =============================================================================
+0000                  3  ; RT/68MX  --  ADM-31 / Lear Siegler adaptation  (crasm, 6800)
+0000                  4  ; ROM B plug-in slot, $E800-$EFFF (2KB, 2716)
+0000                  5  ;
+0000                  6  ; Assemble:  crasm -o rt68mx.srec rt68mx.asm
+0000                  7  ; Binary:    srec_cat rt68mx.srec -o rt68mx.bin -binary   (-> $E800-$EFFF, 2KB)
+0000                  8  ;
+0000                  9  ; Adapted from the Microware RT/68MX console monitor (c)1976,1977.
+0000                 10  ; This build is the MONITOR ONLY (no real-time multitasking executive):
+0000                 11  ;   - native console = ADM-31 keyboard (PIA1 scan/decode) + CRTRAM screen
+0000                 12  ;   - boots directly at reset (ADM-31 RST/SWI/NMI vectors -> $E800)
+0000                 13  ;   - keeps stock ROM C/D physically present (not called)
+0000                 14  ;
+0000                 15  ; DROPPED vs. the original:  RT executive (S cmd, task table, scheduler),
+0000                 16  ;   interrupt handlers, paper-tape LOAD/PUNCH (L/P), the PIA software-UART and
+0000                 17  ;   ACIA serial console paths.  Everything below is plain 6800 (no 6801 ops).
+0000                 18  ;
+0000                 19  ; COMMANDS:  M <,addr>  examine/change      D <,beg><,end>  dump
+0000                 20  ;            E <,addr>  execute (JMP)       G               go / resume (RTI)
+0000                 21  ;            B <,addr>  set breakpoint      R               register/stack dump
+0000                 22  ;            <ESC>      restart monitor
+0000                 23  ;
+0000                 24  ; Address entry is comma-led, MIKBUG style:  e.g.  D,0100,01FF<CR>
+0000                 25  ;
+0000                 26  ; BREAKPOINTS (B/G):  these use SWI ($3F).  The ADM-31's SWI vector lives in
+0000                 27  ;   ROM D and normally points at $E800.  To enable breakpoints, patch ROM D's
+0000                 28  ;   SWI_VEC to the RUNBKP address reported by crasm (see notes file).  Without
+0000                 29  ;   that patch, M/D/E/R and the console all work; only B/G need it.
+0000                 30  ; =============================================================================
+0000                 31  
+0000                 32  
+0000                 33  
+0000                 34  ; ----------------------------------------------------------------------------
+0000                 35  ; ADM-31 hardware (Table 4-1)
+0000                 36  ; ----------------------------------------------------------------------------
+0000  =7000        37  HALT            EQU     $7000       ; video-sync strobe (write anything)
+0000  =7800        38  PIA1            EQU     $7800       ; DA=$7800 CRA=$7801 DB=$7802 CRB=$7803
+0000  =7E00        39  SW_BNK1         EQU     $7E00       ; strap/switch register
+0000  =7F00        40  VTAC            EQU     $7F00       ; video timing controller base
+0000  =8000        41  CRTRAM          EQU     $8000       ; screen RAM
+0000                 42  
+0000  =0050        43  SCRSTRIDE       EQU     80          ; bytes per screen row (verified: $50)
+0000  =0050        44  SCRCOLS         EQU     80          ; visible columns
+0000  =8780        45  SCREND          EQU     $8780       ; one past last visible cell ($8000+24*80)
+0000  =8730        46  LASTROW         EQU     $8730       ; start of bottom row ($8000+23*80)
+0000  =0730        47  SCRCNT          EQU     1840        ; bytes to move on scroll (23*80)
+0000                 48  
+0000                 49  ; ----------------------------------------------------------------------------
+0000                 50  ; RAM layout  (ADM-31 has RAM only at $0000-$03FF; original used $A000)
+0000                 51  ;   monitor variables in page 0 (direct addressing); CPU stack high in page 1
+0000                 52  ; ----------------------------------------------------------------------------
+0000  =0040        53  BEGADR          EQU     $40         ; 2  dump start / current
+0000  =0042        54  ENDADR          EQU     $42         ; 2  dump end / BADDR result / M addr
+0000  =0044        55  SPTMP           EQU     $44         ; 2  saved user stack pointer
+0000  =0046        56  BKPADR          EQU     $46         ; 2  breakpoint address
+0000  =0048        57  BKPOP           EQU     $48         ; 1  breakpoint opcode/flag
+0000  =0049        58  RTMOD           EQU     $49         ; 1  run mode (monitor: 0)
+0000  =004B        59  ERRFLG          EQU     $4B         ; 1  error flag/code
+0000  =004C        60  CURPTR          EQU     $4C         ; 2  screen cursor CRTRAM address
+0000  =004E        61  CURCOL          EQU     $4E         ; 1  cursor column 0..79
+0000  =004F        62  KSCAN           EQU     $4F         ; 1  keyboard scan position
+0000  =0050        63  KMOD            EQU     $50         ; 1  keyboard modifier latch (PIA1_DB)
+0000  =0051        64  KCHAR           EQU     $51         ; 1  decoded key
+0000  =0052        65  KPTR            EQU     $52         ; 2  keyboard-table index scratch
+0000  =0054        66  MSRC            EQU     $54         ; 2  scroll source ptr
+0000  =0056        67  MDST            EQU     $56         ; 2  scroll dest ptr
+0000  =0058        68  MCNT            EQU     $58         ; 2  scroll counter
+0000  =005A        69  SAVEX           EQU     $5A         ; 2  X save (OUT1CH) - no PSHX on 6800
+0000  =005C        70  SAVEX2          EQU     $5C         ; 2  X save (IN1CHR)
+0000                 71  
+0000  =01FF        72  STACK           EQU     $01FF       ; CPU stack top (grows down, page 1)
+0000                 73  
+0000                 74  ; =============================================================================
+E800                 75          ORG $E800
+E800                 76  ; =============================================================================
+E800                 77  ; RESET  --  ADM-31 reset/SWI/NMI vector to $E800; we own the machine.
+E800                 78  ;   Replicates the stock ROM B power-on bring-up (VTAC + PIA1) since the stock
+E800                 79  ;   ROM B no longer runs, then enters the monitor.
+E800                 80  ; =============================================================================
+E800                 81  RESET
+E800  0F             82          SEI
+E801  8E 01 FF       83          LDS     #STACK
+E804                 84  ; --- VTAC video init (stock ROM B $E80A-$E83D) ---
+E804  4F             85          CLRA
+E805  CE 7F 00       86          LDX     #VTAC
+E808  A7 0E          87          STAA    $0E,X               ; VTAC $7F0E = 0
+E80A  A7 0A          88          STAA    $0A,X               ; VTAC $7F0A = 0
+E80C  86 65          89          LDAA    #$65
+E80E  A7 00          90          STAA    $00,X
+E810  86 44          91          LDAA    #$44
+E812  A7 01          92          STAA    $01,X
+E814  86 5D          93          LDAA    #$5D
+E816  A7 02          94          STAA    $02,X
+E818  B6 7E 00       95          LDAA    SW_BNK1
+E81B  84 02          96          ANDA    #$02
+E81D  27 0A          97          BEQ     RVT1
+E81F  86 20          98          LDAA    #$20
+E821  A7 04          99          STAA    $04,X
+E823  86 14         100          LDAA    #$14
+E825  A7 05         101          STAA    $05,X
+E827  20 08         102          BRA     RVT2
+E829                103  RVT1
+E829  86 40         104          LDAA    #$40
+E82B  A7 04         105          STAA    $04,X
+E82D  86 35         106          LDAA    #$35
+E82F  A7 05         107          STAA    $05,X
+E831                108  RVT2
+E831  86 17         109          LDAA    #$17
+E833  A7 03         110          STAA    $03,X
+E835  A7 06         111          STAA    $06,X
+E837  4F            112          CLRA
+E838  A7 0D         113          STAA    $0D,X
+E83A  A7 0C         114          STAA    $0C,X
+E83C  A7 0E         115          STAA    $0E,X
+E83E                116  ; --- PIA1 keyboard init (stock ROM B $E8D4-$E8EF) ---
+E83E  CE 78 00      117          LDX     #PIA1
+E841  6F 01         118          CLR     $01,X
+E843  6F 03         119          CLR     $03,X
+E845  86 7F         120          LDAA    #$7F
+E847  A7 00         121          STAA    $00,X
+E849  86 1D         122          LDAA    #$1D
+E84B  A7 02         123          STAA    $02,X
+E84D  86 3C         124          LDAA    #$3C
+E84F  A7 01         125          STAA    $01,X
+E851  A7 03         126          STAA    $03,X
+E853  86 01         127          LDAA    #$01
+E855  A7 00         128          STAA    $00,X
+E857  A7 02         129          STAA    $02,X
+E859                130  ; --- console state, clear screen, go ---
+E859  9F 44         131          STS     SPTMP
+E85B  86 58         132          LDAA    #$58
+E85D  97 4F         133          STAA    KSCAN
+E85F  BD E8 65      134          JSR     CLS
+E862  7E E9 90      135          JMP     BANNER
+E865                136  
+E865                137  ; =============================================================================
+E865                138  ; CLS  --  clear visible screen, home cursor
+E865                139  ; =============================================================================
+E865                140  CLS
+E865  CE 80 00      141          LDX     #CRTRAM
+E868  DF 4C         142          STX     CURPTR
+E86A  7F 00 4E      143          CLR     CURCOL
+E86D  86 20         144          LDAA    #$20
+E86F                145  CLS1
+E86F  A7 00         146          STAA    $00,X
+E871  08            147          INX
+E872  8C 87 80      148          CPX     #SCREND
+E875  26 F8         149          BNE     CLS1
+E877  39            150          RTS
+E878                151  
+E878                152  ; =============================================================================
+E878                153  ; SCROLL  --  move rows 1..23 up to 0..22, blank row 23, cursor to row 23
+E878                154  ; =============================================================================
+E878                155  SCROLL
+E878  CE 80 50      156          LDX     #CRTRAM+SCRSTRIDE
+E87B  DF 54         157          STX     MSRC
+E87D  CE 80 00      158          LDX     #CRTRAM
+E880  DF 56         159          STX     MDST
+E882  CE 07 30      160          LDX     #SCRCNT
+E885  DF 58         161          STX     MCNT
+E887                162  SCR1
+E887  DE 54         163          LDX     MSRC
+E889  A6 00         164          LDAA    $00,X
+E88B  08            165          INX
+E88C  DF 54         166          STX     MSRC
+E88E  DE 56         167          LDX     MDST
+E890  A7 00         168          STAA    $00,X
+E892  08            169          INX
+E893  DF 56         170          STX     MDST
+E895  DE 58         171          LDX     MCNT
+E897  09            172          DEX
+E898  DF 58         173          STX     MCNT
+E89A  26 EB         174          BNE     SCR1
+E89C  CE 87 30      175          LDX     #LASTROW
+E89F  86 20         176          LDAA    #$20
+E8A1                177  SCR2
+E8A1  A7 00         178          STAA    $00,X
+E8A3  08            179          INX
+E8A4  8C 87 80      180          CPX     #SCREND
+E8A7  26 F8         181          BNE     SCR2
+E8A9  CE 87 30      182          LDX     #LASTROW
+E8AC  DF 4C         183          STX     CURPTR
+E8AE  7F 00 4E      184          CLR     CURCOL
+E8B1  39            185          RTS
+E8B2                186  
+E8B2                187  ; =============================================================================
+E8B2                188  ; OUT1CH  --  print char in A to the ADM-31 screen at the cursor.
+E8B2                189  ;   Preserves B and X (X via SAVEX, since 6800 has no PSHX).  CR = newline,
+E8B2                190  ;   LF ignored, BS erases one cell.  Uses the verified HALT/NOP write pattern.
+E8B2                191  ; =============================================================================
+E8B2                192  OUT1CH
+E8B2  DF 5A         193          STX     SAVEX
+E8B4  37            194          PSHB
+E8B5  16            195          TAB                         ; B = char
+E8B6  C1 0D         196          CMPB    #$0D
+E8B8  27 21         197          BEQ     OC_CR
+E8BA  C1 0A         198          CMPB    #$0A
+E8BC  27 22         199          BEQ     OC_LF
+E8BE  C1 08         200          CMPB    #$08
+E8C0  27 20         201          BEQ     OC_BS
+E8C2  F7 70 00      202          STAB    HALT                ; sync strobe
+E8C5  01            203          NOP
+E8C6  DE 4C         204          LDX     CURPTR
+E8C8  E7 00         205          STAB    $00,X
+E8CA  08            206          INX
+E8CB  DF 4C         207          STX     CURPTR
+E8CD  7C 00 4E      208          INC     CURCOL
+E8D0  96 4E         209          LDAA    CURCOL
+E8D2  81 50         210          CMPA    #SCRCOLS
+E8D4  26 20         211          BNE     OC_RET
+E8D6  BD E8 FA      212          JSR     OC_NL
+E8D9  20 1B         213          BRA     OC_RET
+E8DB                214  OC_CR
+E8DB  BD E8 FA      215          JSR     OC_NL
+E8DE  20 16         216          BRA     OC_RET
+E8E0                217  OC_LF
+E8E0  20 14         218          BRA     OC_RET
+E8E2                219  OC_BS
+E8E2  96 4E         220          LDAA    CURCOL
+E8E4  27 10         221          BEQ     OC_RET
+E8E6  7A 00 4E      222          DEC     CURCOL
+E8E9  DE 4C         223          LDX     CURPTR
+E8EB  09            224          DEX
+E8EC  DF 4C         225          STX     CURPTR
+E8EE  86 20         226          LDAA    #$20
+E8F0  B7 70 00      227          STAA    HALT
+E8F3  01            228          NOP
+E8F4  A7 00         229          STAA    $00,X
+E8F6                230  OC_RET
+E8F6  33            231          PULB
+E8F7  DE 5A         232          LDX     SAVEX
+E8F9  39            233          RTS
+E8FA                234  
+E8FA                235  ; OC_NL -- advance cursor to start of next row; scroll if past bottom
+E8FA                236  OC_NL
+E8FA  96 4E         237          LDAA    CURCOL
+E8FC  40            238          NEGA
+E8FD  8B 50         239          ADDA    #SCRSTRIDE          ; A = SCRSTRIDE - CURCOL
+E8FF  9B 4D         240          ADDA    CURPTR+1
+E901  97 4D         241          STAA    CURPTR+1
+E903  96 4C         242          LDAA    CURPTR
+E905  89 00         243          ADCA    #0
+E907  97 4C         244          STAA    CURPTR
+E909  7F 00 4E      245          CLR     CURCOL
+E90C  DE 4C         246          LDX     CURPTR
+E90E  8C 87 80      247          CPX     #SCREND
+E911  25 03         248          BCS     OC_NLR              ; CURPTR < SCREND
+E913  BD E8 78      249          JSR     SCROLL
+E916                250  OC_NLR
+E916  39            251          RTS
+E917                252  
+E917                253  ; =============================================================================
+E917                254  ; IN1CHR  --  wait for a key, return ASCII in A.  Echoes to screen.
+E917                255  ;   Native keyboard scan + decode (replicates stock ROM B $EE06 scan/decode
+E917                256  ;   using the embedded KBTAB scancode table).  Preserves B and X.
+E917                257  ; =============================================================================
+E917                258  IN1CHR
+E917  DF 5C         259          STX     SAVEX2
+E919  37            260          PSHB
+E91A                261  INC_SCAN
+E91A  96 4F         262          LDAA    KSCAN
+E91C  B7 78 00      263          STAA    PIA1                ; select scan row (PIA1_DA)
+E91F  B6 78 00      264          LDAA    PIA1                ; read back (bit7 = key down)
+E922  2B 09         265          BMI     INC_FOUND
+E924  26 02         266          BNE     INC_DEC             ; readback nonzero -> advance position
+E926  86 58         267          LDAA    #$58                ; readback 0 (pos wrapped) -> reload sentinel
+E928                268  INC_DEC
+E928  4A            269          DECA                        ; next position ($58 sentinel -> $57 first real)
+E929  97 4F         270          STAA    KSCAN
+E92B  20 ED         271          BRA     INC_SCAN            ; block until a key is down
+E92D                272  INC_FOUND
+E92D  F6 78 02      273          LDAB    PIA1+2              ; PIA1_DB column/modifiers
+E930  D7 50         274          STAB    KMOD
+E932  58            275          ASLB
+E933  49            276          ROLA                        ; A = table index
+E934  CE EB 2D      277          LDX     #KBTAB
+E937  DF 52         278          STX     KPTR
+E939  9B 53         279          ADDA    KPTR+1
+E93B  97 53         280          STAA    KPTR+1
+E93D  24 03         281          BCC     INC_NOCY
+E93F  7C 00 52      282          INC     KPTR
+E942                283  INC_NOCY
+E942  DE 52         284          LDX     KPTR
+E944  A6 00         285          LDAA    $00,X               ; scancode table entry
+E946  4D            286          TSTA
+E947  2B 20         287          BMI     INC_STORE           ; bit7 set -> special key, use as-is
+E949  D6 50         288          LDAB    KMOD
+E94B  C5 01         289          BITB    #$01                ; shift?
+E94D  27 0A         290          BEQ     INC_CTRL
+E94F  81 61         291          CMPA    #$61
+E951  2D 06         292          BLT     INC_CTRL
+E953  81 7A         293          CMPA    #$7A
+E955  2E 02         294          BGT     INC_CTRL
+E957  80 20         295          SUBA    #$20                ; lower -> upper
+E959                296  INC_CTRL
+E959  D6 50         297          LDAB    KMOD
+E95B  C5 40         298          BITB    #$40                ; ctrl?
+E95D  27 0A         299          BEQ     INC_STORE
+E95F  81 40         300          CMPA    #$40
+E961  2D 06         301          BLT     INC_STORE
+E963  81 7F         302          CMPA    #$7F
+E965  27 02         303          BEQ     INC_STORE
+E967  84 1F         304          ANDA    #$1F                ; make control code
+E969                305  INC_STORE
+E969  97 51         306          STAA    KCHAR
+E96B                307  ; debounce: wait for release at the same scan position
+E96B                308  INC_REL
+E96B  96 4F         309          LDAA    KSCAN
+E96D  B7 78 00      310          STAA    PIA1
+E970  B6 78 00      311          LDAA    PIA1
+E973  2B F6         312          BMI     INC_REL
+E975                313  ; echo and return char in A
+E975  96 51         314          LDAA    KCHAR
+E977  84 7F         315          ANDA    #$7F
+E979  97 51         316          STAA    KCHAR
+E97B  36            317          PSHA
+E97C  BD E8 B2      318          JSR     OUT1CH
+E97F  32            319          PULA
+E980  33            320          PULB
+E981  DE 5C         321          LDX     SAVEX2
+E983  39            322          RTS
+E984                323  
+E984                324  ; --- console wrappers (preserve original RT/68 call structure) ---
+E984  7E E8 B2      325  OUTCH   JMP     OUT1CH
+E987  7E E9 17      326  INCH    JMP     IN1CHR
+E98A  7E E8 B2      327  OUTEEE  JMP     OUT1CH
+E98D  7E E9 17      328  INEEE   JMP     IN1CHR
+E990                329  
+E990                330  ; =============================================================================
+E990                331  ; BANNER  --  startup banner, printed once at reset before monitor prompt.
+E990                332  ;   Falls through into CONENT.
+E990                333  ; =============================================================================
+E990                334  BANNER
+E990  CE EB ED      335          LDX     #BANSTR
+E993  BD EA E7      336          JSR     PDATA1
+E996                337  ; =============================================================================
+E996                338  ; Console monitor entry
+E996                339  ; =============================================================================
+E996                340  CONENT
+E996  7F 00 48      341          CLR     BKPOP
+E999  7F 00 49      342          CLR     RTMOD
+E99C                343  CONSOL
+E99C  7F 00 4B      344          CLR     ERRFLG
+E99F  8E 01 FF      345          LDS     #STACK
+E9A2  BD EA EE      346          JSR     CRLF
+E9A5  86 24         347          LDAA    #'$'
+E9A7  BD E9 8A      348          JSR     OUTEEE
+E9AA  BD E9 8D      349          JSR     INEEE               ; command code -> A
+E9AD  CE EC 12      350          LDX     #CMDTBL-3
+E9B0                351  CMSRCH
+E9B0  08            352          INX
+E9B1  08            353          INX
+E9B2  08            354          INX
+E9B3  E6 00         355          LDAB    $00,X               ; table code
+E9B5  27 0D         356          BEQ     CMDERR              ; 0 = end of table
+E9B7  11            357          CBA                         ; typed (A) vs table (B)
+E9B8  26 F6         358          BNE     CMSRCH
+E9BA  EE 01         359          LDX     $01,X               ; handler address
+E9BC  AD 00         360          JSR     $00,X
+E9BE                361  TSTENT
+E9BE  BD EA 4E      362          JSR     ERTEST
+E9C1  7E E9 9C      363          JMP     CONSOL
+E9C4                364  CMDERR
+E9C4  C6 36         365          LDAB    #'6'
+E9C6  7E EA 52      366          JMP     ERROR
+E9C9                367  
+E9C9                368  ; =============================================================================
+E9C9                369  ; Command handlers
+E9C9                370  ; =============================================================================
+E9C9                371  ; set/remove breakpoint (swap opcode with $3F via BKPOP)
+E9C9                372  SETBKP
+E9C9  96 48         373          LDAA    BKPOP
+E9CB  27 08         374          BEQ     SBRET
+E9CD  DE 46         375          LDX     BKPADR
+E9CF  E6 00         376          LDAB    $00,X
+E9D1  A7 00         377          STAA    $00,X
+E9D3  D7 48         378          STAB    BKPOP
+E9D5                379  SBRET
+E9D5  39            380          RTS
+E9D6                381  
+E9D6                382  ; prepare to run user code (monitor-only: just (re)insert breakpoint)
+E9D6                383  SETRUN
+E9D6  BD E9 C9      384          JSR     SETBKP
+E9D9  39            385          RTS
+E9DA                386  
+E9DA                387  ; "E" execute at address (JMP)
+E9DA                388  EXCOM
+E9DA  BD EA 38      389          JSR     GETADR
+E9DD  BD E9 D6      390          JSR     SETRUN
+E9E0  DE 42         391          LDX     ENDADR
+E9E2  6E 00         392          JMP     $00,X
+E9E4                393  
+E9E4                394  ; "G" go / resume from breakpoint (RTI off saved frame)
+E9E4                395  GOCOM
+E9E4  9E 44         396          LDS     SPTMP
+E9E6  BD E9 D6      397          JSR     SETRUN
+E9E9  3B            398          RTI
+E9EA                399  
+E9EA                400  ; "B" set breakpoint
+E9EA                401  BKPCOM
+E9EA  7F 00 48      402          CLR     BKPOP
+E9ED  BD EA 38      403          JSR     GETADR
+E9F0  DF 46         404          STX     BKPADR
+E9F2  86 3F         405          LDAA    #$3F
+E9F4  97 48         406          STAA    BKPOP
+E9F6  39            407          RTS
+E9F7                408  
+E9F7                409  ; "D" dump memory
+E9F7                410  DMPCOM
+E9F7  BD EA 33      411          JSR     GET2AD
+E9FA  7E EA 60      412          JMP     DUMP
+E9FD                413  
+E9FD                414  ; "M" examine / change memory
+E9FD                415  MEMCOM
+E9FD  BD EA 38      416          JSR     GETADR
+EA00                417  MEM1
+EA00  BD EA EE      418          JSR     CRLF
+EA03                419  MEM2
+EA03  86 0D         420          LDAA    #$0D
+EA05  BD E9 8A      421          JSR     OUTEEE
+EA08  CE 00 42      422          LDX     #ENDADR
+EA0B  BD EA D8      423          JSR     OUT4HS              ; print address
+EA0E  DE 42         424          LDX     ENDADR
+EA10  BD EA CE      425          JSR     OUT2H               ; print contents (X advances)
+EA13  DF 42         426          STX     ENDADR
+EA15  BD E9 8D      427          JSR     INEEE               ; delimiter
+EA18  81 0A         428          CMPA    #$0A
+EA1A  27 E7         429          BEQ     MEM2                ; LF -> next location
+EA1C  81 2F         430          CMPA    #'/'
+EA1E  27 01         431          BEQ     MEM3                ; '/' -> change
+EA20  39            432          RTS                         ; CR -> done
+EA21                433  MEM3
+EA21  BD EB 0D      434          JSR     BYTE                ; new value -> A
+EA24  BD EA 4E      435          JSR     ERTEST
+EA27  09            436          DEX
+EA28  A7 00         437          STAA    $00,X
+EA2A  A1 00         438          CMPA    $00,X
+EA2C  27 D2         439          BEQ     MEM1
+EA2E  C6 35         440          LDAB    #'5'
+EA30  7E EA 52      441          JMP     ERROR
+EA33                442  
+EA33                443  ; read two comma-led addresses -> BEGADR (first), ENDADR/X (second)
+EA33                444  GET2AD
+EA33  BD EA 38      445          JSR     GETADR
+EA36  DF 40         446          STX     BEGADR
+EA38                447  GETADR
+EA38  BD E9 8D      448          JSR     INEEE
+EA3B  81 0D         449          CMPA    #$0D
+EA3D  27 0C         450          BEQ     GA_ABORT
+EA3F  81 2C         451          CMPA    #','
+EA41  27 03         452          BEQ     GA_C
+EA43  7E EA 52      453          JMP     ERROR
+EA46                454  GA_C
+EA46  BD EB 20      455          JSR     BADDR
+EA49  20 03         456          BRA     ERTEST
+EA4B                457  GA_ABORT
+EA4B  7E E9 9C      458          JMP     CONSOL
+EA4E                459  
+EA4E                460  ; error test / handler
+EA4E                461  ERTEST
+EA4E  D6 4B         462          LDAB    ERRFLG
+EA50  27 0D         463          BEQ     RETURN
+EA52                464  ERROR
+EA52  CE EB E1      465          LDX     #ERRMSG
+EA55  BD EA E7      466          JSR     PDATA1
+EA58  17            467          TBA
+EA59  BD E9 8A      468          JSR     OUTEEE
+EA5C  7E E9 9C      469          JMP     CONSOL
+EA5F                470  RETURN
+EA5F  39            471          RTS
+EA60                472  
+EA60                473  ; =============================================================================
+EA60                474  ; DUMP  --  print 16 bytes/line from BEGADR until ENDADR reached
+EA60                475  ; =============================================================================
+EA60                476  DUMP
+EA60  BD EA EE      477          JSR     CRLF
+EA63  CE 00 40      478          LDX     #BEGADR
+EA66  BD EA D8      479          JSR     OUT4HS              ; line address
+EA69  C6 10         480          LDAB    #16
+EA6B  DE 40         481          LDX     BEGADR
+EA6D                482  DUMP1
+EA6D  BD EA DB      483          JSR     OUT2HS              ; byte + space (X advances 1)
+EA70  09            484          DEX
+EA71  9C 42         485          CPX     ENDADR
+EA73  26 01         486          BNE     DUMP2
+EA75  39            487          RTS
+EA76                488  DUMP2
+EA76  08            489          INX
+EA77  5A            490          DECB
+EA78  26 F3         491          BNE     DUMP1
+EA7A  DF 40         492          STX     BEGADR
+EA7C  20 E2         493          BRA     DUMP
+EA7E                494  
+EA7E                495  ; =============================================================================
+EA7E                496  ; "R" / breakpoint -- print saved stack:  SP CC B A XR PC
+EA7E                497  ; =============================================================================
+EA7E                498  PRSTAK
+EA7E  BD EA EE      499          JSR     CRLF
+EA81  CE 00 44      500          LDX     #SPTMP
+EA84  BD EA D8      501          JSR     OUT4HS              ; SP
+EA87  DE 44         502          LDX     SPTMP
+EA89                503  PRSTK
+EA89  08            504          INX
+EA8A  BD EA DB      505          JSR     OUT2HS              ; CC
+EA8D  BD EA DB      506          JSR     OUT2HS              ; B
+EA90  BD EA DB      507          JSR     OUT2HS              ; A
+EA93  BD EA D8      508          JSR     OUT4HS              ; XR
+EA96  7E EA D8      509          JMP     OUT4HS              ; PC (tail)
+EA99                510  
+EA99                511  ; =============================================================================
+EA99                512  ; SWI breakpoint service (RUNBKP).  Reached only if ROM D SWI_VEC is patched
+EA99                513  ; to point here.  Restores the breakpoint opcode and dumps the frame.
+EA99                514  ; =============================================================================
+EA99                515  RUNBKP
+EA99  30            516          TSX
+EA9A  BD EA B2      517          JSR     ADJSTK              ; back PC up over the SWI
+EA9D  EE 05         518          LDX     $05,X               ; task PC from frame
+EA9F  9C 46         519          CPX     BKPADR
+EAA1  27 04         520          BEQ     RUNBK2
+EAA3  C6 37         521          LDAB    #'7'
+EAA5  D7 4B         522          STAB    ERRFLG
+EAA7                523  RUNBK2
+EAA7  BD E9 C9      524          JSR     SETBKP              ; remove breakpoint opcode
+EAAA  9F 44         525          STS     SPTMP
+EAAC  BD EA 7E      526          JSR     PRSTAK
+EAAF  7E E9 9C      527          JMP     CONSOL
+EAB2                528  ADJSTK
+EAB2  6D 00         529          TST     $00,X
+EAB4  26 02         530          BNE     ADSTK2
+EAB6  6A 05         531          DEC     $05,X
+EAB8                532  ADSTK2
+EAB8  6A 06         533          DEC     $06,X
+EABA  39            534          RTS
+EABB                535  
+EABB                536  ; =============================================================================
+EABB                537  ; Hex / ASCII I/O utilities (unchanged RT/68 logic, pure 6800)
+EABB                538  ; =============================================================================
+EABB  7E E8 B2      539  OUTC2   JMP     OUT1CH              ; local trampoline (OUTCH out of branch range)
+EABE                540  OUTHL
+EABE  44            541          LSRA
+EABF  44            542          LSRA
+EAC0  44            543          LSRA
+EAC1  44            544          LSRA
+EAC2                545  OUTHR
+EAC2  84 0F         546          ANDA    #$0F
+EAC4  8B 30         547          ADDA    #$30
+EAC6  81 39         548          CMPA    #$39
+EAC8  23 F1         549          BLS     OUTC2
+EACA  8B 07         550          ADDA    #$07
+EACC  20 ED         551          BRA     OUTC2
+EACE                552  
+EACE                553  OUT2H
+EACE  A6 00         554          LDAA    $00,X
+EAD0  BD EA BE      555          JSR     OUTHL
+EAD3  A6 00         556          LDAA    $00,X
+EAD5  08            557          INX
+EAD6  20 EA         558          BRA     OUTHR
+EAD8                559  
+EAD8                560  OUT4HS
+EAD8  BD EA CE      561          JSR     OUT2H
+EADB                562  OUT2HS
+EADB  BD EA CE      563          JSR     OUT2H
+EADE                564  OUTS
+EADE  86 20         565          LDAA    #$20
+EAE0  7E E9 84      566          JMP     OUTCH
+EAE3                567  
+EAE3                568  PDATA2
+EAE3  BD E9 84      569          JSR     OUTCH
+EAE6  08            570          INX
+EAE7                571  PDATA1
+EAE7  A6 00         572          LDAA    $00,X
+EAE9  81 04         573          CMPA    #$04
+EAEB  26 F6         574          BNE     PDATA2
+EAED  39            575          RTS
+EAEE                576  
+EAEE                577  CRLF
+EAEE  CE EB EB      578          LDX     #CRLSTR
+EAF1  7E EA E7      579          JMP     PDATA1
+EAF4                580  
+EAF4                581  HBAD
+EAF4  86 33         582          LDAA    #'3'
+EAF6  97 4B         583          STAA    ERRFLG
+EAF8  39            584          RTS
+EAF9                585  INHEX
+EAF9  BD E9 87      586          JSR     INCH
+EAFC  80 30         587          SUBA    #$30
+EAFE  25 F4         588          BCS     HBAD
+EB00  81 09         589          CMPA    #$09
+EB02  23 08         590          BLS     IHRET
+EB04  80 07         591          SUBA    #$07
+EB06  25 EC         592          BCS     HBAD
+EB08  81 0F         593          CMPA    #$0F
+EB0A  22 E8         594          BHI     HBAD
+EB0C                595  IHRET
+EB0C  39            596          RTS
+EB0D                597  
+EB0D                598  BYTE
+EB0D  37            599          PSHB
+EB0E  BD EA F9      600          JSR     INHEX
+EB11  48            601          ASLA
+EB12  48            602          ASLA
+EB13  48            603          ASLA
+EB14  48            604          ASLA
+EB15  16            605          TAB
+EB16  BD EA F9      606          JSR     INHEX
+EB19  1B            607          ABA
+EB1A  33            608          PULB
+EB1B  36            609          PSHA
+EB1C  1B            610          ABA                         ; running checksum in B (harmless here)
+EB1D  16            611          TAB
+EB1E  32            612          PULA
+EB1F  39            613          RTS
+EB20                614  
+EB20                615  BADDR
+EB20  BD EB 0D      616          JSR     BYTE
+EB23  97 42         617          STAA    ENDADR
+EB25  BD EB 0D      618          JSR     BYTE
+EB28  97 43         619          STAA    ENDADR+1
+EB2A  DE 42         620          LDX     ENDADR
+EB2C  39            621          RTS
+EB2D                622  
+EB2D                623  ; =============================================================================
+EB2D                624  ; Keyboard scancode table  (copy of stock ROM B $EA1A-$EAC9)
+EB2D                625  ; =============================================================================
+EB2D                626  KBTAB
+EB2D  D1 D1 D7 D7   627          DB      $D1,$D1,$D7,$D7,$C5,$C5,$D2,$D2
+EB35  D4 F4 D9 F9   628          DB      $D4,$F4,$D9,$F9,$32,$22,$1B,$1B
+EB3D  7F 7F 9E 9F   629          DB      $7F,$7F,$9E,$9F,$D0,$F0,$B4,$B6
+EB45  92 93 31 21   630          DB      $92,$93,$31,$21,$71,$51,$98,$98
+EB4D  33 23 34 24   631          DB      $33,$23,$34,$24,$35,$25,$36,$26
+EB55  37 27 38 28   632          DB      $37,$27,$38,$28,$39,$29,$30,$5F
+EB5D  2D 3D 5E 7E   633          DB      $2D,$3D,$5E,$7E,$5C,$7C,$09,$C9
+EB65  87 87 88 88   634          DB      $87,$87,$88,$88,$89,$89,$2D,$2D
+EB6D  77 57 65 45   635          DB      $77,$57,$65,$45,$72,$52,$74,$54
+EB75  79 59 75 55   636          DB      $79,$59,$75,$55,$69,$49,$6F,$4F
+EB7D  70 50 5B 7B   637          DB      $70,$50,$5B,$7B,$5D,$7D,$0D,$0D
+EB85  84 84 85 85   638          DB      $84,$84,$85,$85,$86,$86,$09,$09
+EB8D  61 41 73 53   639          DB      $61,$41,$73,$53,$64,$44,$66,$46
+EB95  67 47 68 48   640          DB      $67,$47,$68,$48,$6A,$4A,$6B,$4B
+EB9D  6C 4C 3B 2B   641          DB      $6C,$4C,$3B,$2B,$3A,$2A,$40,$60
+EBA5  0A 0A 82 82   642          DB      $0A,$0A,$82,$82,$83,$83,$81,$81
+EBAD  90 91 7A 5A   643          DB      $90,$91,$7A,$5A,$78,$58,$63,$43
+EBB5  76 56 62 42   644          DB      $76,$56,$62,$42,$6E,$4E,$6D,$4D
+EBBD  2C 3C 2E 3E   645          DB      $2C,$3C,$2E,$3E,$2F,$3F,$20,$20
+EBC5  1F CA 30 30   646          DB      $1F,$CA,$30,$30,$2E,$2E,$0D,$0D
+EBCD  9D 94 1E 1E   647          DB      $9D,$94,$1E,$1E,$0A,$0A,$0B,$0B
+EBD5  08 08 0C 0C   648          DB      $08,$08,$0C,$0C,$E3,$00,$2C,$2C
+EBDD  00 00 00 00   649          DB      $00,$00,$00,$00     ; guard: out-of-range indices read NUL
+EBE1                650  
+EBE1                651  ; =============================================================================
+EBE1                652  ; Strings and command table
+EBE1                653  ; =============================================================================
+EBE1  20 45 52 52   654  ERRMSG  DB      $20,'E','R','R','O','R',':',$20,$20,$04
+EBEB  0D 04         655  CRLSTR  DB      $0D,$04
+EBED  0D            656  BANSTR  DB      $0D
+EBEE  52 54 2F 36   657          DB      'R','T','/','6','8','0','0'
+EBF5  20 20         658          DB      $20,$20
+EBF7  41 44 4D 2D   659          DB      'A','D','M','-','3','1'
+EBFD  20 20         660          DB      $20,$20
+EBFF  52 4F 4D 2D   661          DB      'R','O','M','-','M','O','N','.'
+EC07  20 20         662          DB      $20,$20
+EC09  56 45 52 20   663          DB      'V','E','R',$20,'1','.','0'
+EC10  0D 0D         664          DB      $0D,$0D
+EC12  0D 0D         665          DB      $0D,$0D
+EC14  04            666          DB      $04
+EC15                667  CMDTBL
+EC15  42            668          DB      'B'
+EC16  E9 EA         669          DW      BKPCOM
+EC18  44            670          DB      'D'
+EC19  E9 F7         671          DW      DMPCOM
+EC1B  45            672          DB      'E'
+EC1C  E9 DA         673          DW      EXCOM
+EC1E  47            674          DB      'G'
+EC1F  E9 E4         675          DW      GOCOM
+EC21  4D            676          DB      'M'
+EC22  E9 FD         677          DW      MEMCOM
+EC24  52            678          DB      'R'
+EC25  EA 7E         679          DW      PRSTAK
+EC27  1B            680          DB      $1B
+EC28  E8 00         681          DW      RESET
+EC2A  00            682          DB      0
+EC2B                683  
+EC2B                684  ; --- fill to top of the 2KB ROM B image ---
+EC2B                685  
+
+SYMBOL TABLE
+  HALT     7000
+  PIA1     7800
+  SW_BNK1  7E00
+  VTAC     7F00
+  CRTRAM   8000
+  SCRSTRIDE 0050
+  SCRCOLS  0050
+  SCREND   8780
+  LASTROW  8730
+  SCRCNT   0730
+  BEGADR   0040
+  ENDADR   0042
+  SPTMP    0044
+  BKPADR   0046
+  BKPOP    0048
+  RTMOD    0049
+  ERRFLG   004B
+  CURPTR   004C
+  CURCOL   004E
+  KSCAN    004F
+  KMOD     0050
+  KCHAR    0051
+  KPTR     0052
+  MSRC     0054
+  MDST     0056
+  MCNT     0058
+  SAVEX    005A
+  SAVEX2   005C
+  STACK    01FF
+  RESET    E800
+  RVT1     E829
+  RVT2     E831
+  CLS      E865
+  CLS1     E86F
+  SCROLL   E878
+  SCR1     E887
+  SCR2     E8A1
+  OUT1CH   E8B2
+  OC_CR    E8DB
+  OC_LF    E8E0
+  OC_BS    E8E2
+  OC_RET   E8F6
+  OC_NL    E8FA
+  OC_NLR   E916
+  IN1CHR   E917
+  INC_SCAN E91A
+  INC_DEC  E928
+  INC_FOUND E92D
+  INC_NOCY E942
+  INC_CTRL E959
+  INC_STORE E969
+  INC_REL  E96B
+  OUTCH    E984
+  INCH     E987
+  OUTEEE   E98A
+  INEEE    E98D
+  BANNER   E990
+  CONENT   E996
+  CONSOL   E99C
+  CMSRCH   E9B0
+  TSTENT   E9BE
+  CMDERR   E9C4
+  SETBKP   E9C9
+  SBRET    E9D5
+  SETRUN   E9D6
+  EXCOM    E9DA
+  GOCOM    E9E4
+  BKPCOM   E9EA
+  DMPCOM   E9F7
+  MEMCOM   E9FD
+  MEM1     EA00
+  MEM2     EA03
+  MEM3     EA21
+  GET2AD   EA33
+  GETADR   EA38
+  GA_C     EA46
+  GA_ABORT EA4B
+  ERTEST   EA4E
+  ERROR    EA52
+  RETURN   EA5F
+  DUMP     EA60
+  DUMP1    EA6D
+  DUMP2    EA76
+  PRSTAK   EA7E
+  PRSTK    EA89
+  RUNBKP   EA99
+  RUNBK2   EAA7
+  ADJSTK   EAB2
+  ADSTK2   EAB8
+  OUTC2    EABB
+  OUTHL    EABE
+  OUTHR    EAC2
+  OUT2H    EACE
+  OUT4HS   EAD8
+  OUT2HS   EADB
+  OUTS     EADE
+  PDATA2   EAE3
+  PDATA1   EAE7
+  CRLF     EAEE
+  HBAD     EAF4
+  INHEX    EAF9
+  IHRET    EB0C
+  BYTE     EB0D
+  BADDR    EB20
+  KBTAB    EB2D
+  ERRMSG   EBE1
+  CRLSTR   EBEB
+  BANSTR   EBED
+  CMDTBL   EC15
+
+====================================================================
+ASSEMBLY SUMMARY
+====================================================================
+TOTAL ERRORS: 0
+STATUS: ASSEMBLY SUCCESSFUL - NO ERRORS
+====================================================================

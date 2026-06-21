@@ -600,3 +600,7 @@ ENTER `$4F` · SPACE `$75` · `X` `$42` · `[` `$29`.
 *Document covers `acp6800.c` (v1.3) and `adm31emu.c` as built in this project.
 Hardware facts are from the ADM-31 Table 4-1 chip-select map and verified
 against the firmware ROMs and the Rubout / Shuttle Attack / CINT plugin ROMs.*
+
+<img width="3024" height="4032" alt="image" src="https://github.com/user-attachments/assets/c73a6360-2fde-4207-8f31-ece9ef6eef5f" />
+
+

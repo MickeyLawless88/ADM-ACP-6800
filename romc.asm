@@ -5,7 +5,7 @@
 ; Disassembled by Mickey W. Lawless
 ; ===========================================================================
 
-        CPU     6800
+        
 
 HALT             EQU     $7000
 PIA1_DA          EQU     $7800
@@ -19,7 +19,7 @@ SW_BNK1          EQU     $7E00
 VTAC             EQU     $7F00
 CRTRAM           EQU     $8000
 
-        *= $F000
+        ORG      $F000
 
         BRA     $EFC8               ; $F000  20 C6
         BRA     $F082               ; $F002  20 7E
@@ -767,3 +767,4 @@ L_F7EB          ORAA    $19                 ; $F7EB  9A 19
         SUBB    $17                 ; $F7EF  D0 17
         DB      $D7,$BA,$DE,$13,$D6,$18,$2A,$08   ; $F7F1  ......*.
         DB      $B7,$70,$00,$01,$E6,$00,$2B   ; $F7F9  .p....+
+        END

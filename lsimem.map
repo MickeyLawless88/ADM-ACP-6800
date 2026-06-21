@@ -1,0 +1,191 @@
+==========================================================================================================================
+                                    LEAR SIEGLER ADM-31  --  MC-6800  ROM ADDRESS MAP
+                        2KB x 4 ROMs  *  $E000-$FFFF  *  8192 bytes  *  verified vs binaries
+==========================================================================================================================
+
+ LEGEND:
+ ----------------------------------------------------------------------------------
+  [FW ]  Firmware / Terminal OS
+  [CHR]  Character generator & display tables
+  [HW ]  Hardware drivers (VTAC / PIA / ACIA)
+  [VEC]  Interrupt & Reset vectors
+  [GAM]  Game / Application ROM (plugin slot)
+  [DSP]  Escape / command dispatch table
+  [...]  Unused / padding
+ ----------------------------------------------------------------------------------
+
+ ROM NOMENCLATURE  (manual Table 4-1 vs chip part numbers)
+ ----------------------------------------------------------------------------------
+  Manual name   Address range   Part number     Role
+  ----------    -------------   -----------     --------------------------------
+  ROM A         $E000-$E7FF     (plugin slot)   Swappable game / application ROM
+  ROM B         $E800-$EFFF     129867-67       Firmware: init, dispatch, serial ISR
+  ROM C*        $E000-$FFFF     129867-66       Firmware: cursor, parser, screen ops
+  ROM D*        $F800-$FFFF     129867-65       Firmware: char out, scroll, vectors
+  (* = Standard PROMs per manual)
+
+ ----------------------------------------------------------------------------------
+
+ ADDRESS SPACE:
+  $E000        $E400        $E800        $EC00        $F000        $F400        $F800        $FC00     $10000
+  |            |            |            |            |            |            |            |            |
+
+ ----------------------------------------------------------------------------------
+  ROM A  (plugin slot)   $E000-$E7FF   [2048 bytes / 2KB]   ** SWAPPABLE **
+ ----------------------------------------------------------------------------------
+  +-----+--------------------------------------------+------------------------------+-------+
+  | GAM |                   GAM                      |             GAM              |  GAM  |
+  | sig |              Game / App code               |        Data / strings        |  pad  |
+  | $02 |                   $3FE                     |             $1F0             |  $10  |
+  +-----+--------------------------------------------+------------------------------+-------+
+  $E000 $E002                                        $E600                          $E7F0
+
+    $E000-$E001  [GAM]  "TJ" signature             $54 $4A -- firmware validates before enabling plugin
+    $E002-$E5FF  [GAM]  Game / application code    Cosmic Intruders confirmed; other titles same format
+    $E600-$E7EF  [GAM]  Game data / strings        Sprite tables, score strings, text data
+    $E7F0-$E7FF  [GAM]  Tail / padding             $FF fill to 2KB boundary
+
+  KNOWN PLUGIN ROMs:
+    Rubout v1.0       $54 $4A  (TJ)  1981   David Menard -- Breakout variant
+    Cosmic Intruders  $54 $4A  (TJ)  c.1981 ADM-31/32 Space Invaders clone  [verified]
+    Space Invaders    $54 $4A  (TJ)  c.1982 Classic SI port
+    Shuttle Attack v2 $54 $4A  (TJ)  1982   Copyright (C) 1982
+    ETA-3400 BASIC    $54 $4A  (TJ)  --     ADM-31 Tiny BASIC port (in progress)
+
+ ----------------------------------------------------------------------------------
+  ROM B  (129867-67)   $E800-$EFFF   [2048 bytes / 2KB]   ** RESET ENTRY POINT **
+ ----------------------------------------------------------------------------------
+  +-------+---------------+------------------+------------------+-----------+-----+
+  |  FW   |      FW       |       DSP        |       FW         |    FW     | VEC |
+  | RESET |  Init / setup | Escape cmd table | Serial / printer | Scrn ops  | pad |
+  | $080  |     $080      |      $300        |      $180        |   $080    | $20 |
+  +-------+---------------+------------------+------------------+-----------+-----+
+  $E800   $E880           $EB00              $EE00              $EF80      $EFE0
+
+    $E800-$E87F  [FW]   RESET entry / init         ** RST vector -> $E800 **
+                                                   SEI, VTAC init, PIA1 init, ACIA init
+    $E880-$EAFF  [FW]   Terminal setup / RAM init  Stack, zero-page clear, screen blank
+    $EB00-$EDFF  [DSP]  Escape cmd dispatch table  16-bit pointer table -> ROM B/C/D handlers
+    $EE00-$EF7F  [FW]   Serial / printer ISR       ACIA1 ($7A00) + PRNTER ($7C00) handler
+    $EF80-$EFDF  [FW]   Screen write primitives    Char gen support, CRTRAM write helpers
+    $EFE0-$EFFF  [VEC]  Tail / padding             Branch targets / $FF fill
+
+    NOTE: $E800 is the TRUE cold-boot entry -- RST vector ($FFFE/$FFFF) -> $E800, not $F800.
+          SWI and NMI also point to $E800 as safe reset fallback.
+
+ ----------------------------------------------------------------------------------
+  ROM C*  (129867-66)   $F000-$F7FF   [2048 bytes / 2KB]
+ ----------------------------------------------------------------------------------
+  +-----------+------------------+------------------+-----------+-----------+-----------+
+  |     FW    |        FW        |        FW        |    FW     |     FW    |     FW    |
+  | Cmd parser|  Cursor routines |   Screen ops     |Scroll/fill| Line ops  | Tab/misc  |
+  |   $100    |       $200       |       $200       |   $100    |    $100   |    $100   |
+  +-----------+------------------+------------------+-----------+-----------+-----------+
+  $F000       $F100              $F300              $F500       $F600       $F700
+
+    $F000-$F0FF  [FW]   Cmd parser / VT52          Escape + control sequence dispatcher
+    $F100-$F2FF  [FW]   Cursor routines            Up / dn / lt / rt, home, wrap, scroll
+    $F300-$F4FF  [FW]   Screen / memory ops        RAM test, screen clear, video fill
+    $F500-$F5FF  [FW]   Scroll / attr ops          Scroll up, attribute byte helpers
+    $F600-$F6FF  [FW]   Line ops                   CR, LF, erase line, VTAC timing
+    $F700-$F7FF  [FW]   Tab / misc                 Horizontal tab, bell, misc utilities
+
+ ----------------------------------------------------------------------------------
+  ROM D*  (129867-65)   $F800-$FFFF   [2048 bytes / 2KB]   ** VECTORS HERE **
+ ----------------------------------------------------------------------------------
+  +-------+---------------+-------------------+-----------+-------------------+-------+-----+
+  |  FW   |      FW       |        FW         |    FW     |        FW         |  FW   | VEC |
+  |display|Scroll/attr wr |Char out+DEL hndlr |String/line| Mode / setup cmds | Misc  | vec |
+  | $080  |     $180      |       $200        |    $100   |       $200        | $0F8  | $08 |
+  +-------+---------------+-------------------+-----------+-------------------+-------+-----+
+  $F800   $F880           $FA00              $FC00        $FD00              $FF00   $FFF8
+
+    $F800-$F87F  [FW]   Display / video ops        CRTRAM write, video RAM access routines
+    $F880-$F9FF  [FW]   Scroll / attr write        Scroll up one line, attribute byte write
+    $FA00-$FBFF  [FW]   Char out + DEL handler     $FCF5: char to CRTRAM;  $FB26: rubout/DEL
+    $FC00-$FCFF  [FW]   String / line ops          String output, CR/LF, end-of-line detect
+    $FD00-$FEFF  [FW]   Mode / setup cmds          Terminal mode regs, baud rate, setup menu
+    $FF00-$FFF7  [FW]   Misc subroutines           Parity, timing loops, bell, HALT strobe
+    $FFF8-$FFFF  [VEC]  Interrupt vectors          See vector table below
+
+    Interrupt vectors ($FFF8-$FFFF, 8 bytes):
+      $FFF8/$FFF9  [IRQ]  -> $ED83   Serial/printer ISR (ACIA1 + PRNTER poll)
+      $FFFA/$FFFB  [SWI]  -> $E800   Reset fallback (cold boot)
+      $FFFC/$FFFD  [NMI]  -> $E800   Reset fallback (cold boot)
+      $FFFE/$FFFF  [RST]  -> $E800   Power-on RESET -> ROM B cold boot entry
+
+==========================================================================================================================
+ KEY ENTRY POINTS AND SUBROUTINES
+==========================================================================================================================
+  ADDRESS    LABEL                        ROM     DESCRIPTION
+  ----------------------------------------------------------------------------------------------------------------------
+  $E000      Plugin ROM sig "TJ"          ROM A   $54 $4A -- firmware checks before enabling ESC polling hook
+  $E800      RESET entry / cold boot      ROM B   ** True reset entry ** SEI + full hardware init
+  $E880      Terminal RAM init            ROM B   Stack init, zero-page clear, screen blank
+  $EB00      Escape dispatch table        ROM B   16-bit pointer table for escape/ctrl sequence handlers
+  $ED83      Serial / printer ISR         ROM B   IRQ target: polls ACIA1 ($7A00) and PRNTER ($7C00)
+  $EE00      ACIA / PIA receive handler   ROM B   Reads $7A01 data reg; PIA1 ($7800) keyboard scan
+  $F000      Terminal command parser      ROM C   Escape sequence & control code dispatcher
+  $F100      Cursor move routines         ROM C   Up / down / left / right, wrap logic
+  $F317      Screen / memory ops          ROM C   RAM test ($AA pattern), screen clear/fill
+  $F500      Scroll / attr helpers        ROM C   Scroll up, attribute byte write
+  $F600      Line / VTAC ops             ROM C   CR, LF, tab, VTAC ($7F00) timing maintenance
+  $F800      Display / video routines     ROM D   CRTRAM ($8000-$88FF) access, video RAM ops
+  $F879      Scroll up one line           ROM D   Block-copies CRTRAM up, blanks last row
+  $F9B5      Attribute write              ROM D   Writes video attribute byte at cursor position
+  $FB26      Rubout / DEL handler         ROM D   Deletes char left of cursor, adjusts position
+  $FCF5      Char output to screen        ROM D   Puts char in CRTRAM, advances cursor
+  $FFF8      IRQ vector -> $ED83          ROM D   Hardware IRQ -> serial/printer ISR
+  $FFFA      SWI vector -> $E800          ROM D   Software interrupt -> cold boot (fallback)
+  $FFFC      NMI vector -> $E800          ROM D   Non-maskable interrupt -> cold boot (fallback)
+  $FFFE      RESET vector -> $E800        ROM D   Power-on / RESET -> ROM B cold boot
+
+==========================================================================================================================
+ I/O MAP  (from manual Table 4-1 chip select signals)
+==========================================================================================================================
+  ADDRESS        SIGNAL          DESCRIPTION
+  ----------------------------------------------------------------------------------------------------------------------
+  $7000          HALT            Write strobe -- halts CPU bus (heavily used in display timing)
+  $7800-$7803    PIA1            MC6820 PIA -- keyboard matrix, parallel I/O
+  $7900          SW BNK2         Switch bank 2 (DIP switch / config register)
+  $7A00-$7A01    ACIA1           MC6850 ACIA -- serial port ($7A00 status/ctrl, $7A01 data)
+  $7B00          PERROM/ANSPER   Personality ROM / answer peripheral select
+  $7C00-$7C01    PRNTER          Printer port (polled in IRQ ISR alongside ACIA1)
+  $7D00          SW BNK3         Switch bank 3
+  $7E00          SW BNK1         Switch bank 1
+  $7F00-$7F0E    VTAC            CRT video timing AC -- display timing registers
+  $8000-$88FF    CRTRAM          Character / video RAM  (2304 bytes, $900)
+
+==========================================================================================================================
+ MEMORY MAP SUMMARY
+==========================================================================================================================
+  ADDRESS RANGE       SIZE    PART / SIGNAL   CONTENTS
+  ----------------------------------------------------------------------------------------------------------------------
+  $0001 - $003F       63B     RAM             Stack
+  $0140 - $0147        8B     RAM             XMIT buffer
+  $0148 - $0400      696B     RAM             RCV buffer
+  $7000               --      HALT            CPU bus halt strobe
+  $7800 - $7803        4B     PIA1            Keyboard / parallel I/O
+  $7900                1B     SW BNK2         Switch bank 2
+  $7A00 - $7A01        2B     ACIA1           Serial port
+  $7B00                1B     PERROM/ANSPER   Personality ROM select
+  $7C00 - $7C01        2B     PRNTER          Printer port
+  $7D00                1B     SW BNK3         Switch bank 3
+  $7E00                1B     SW BNK1         Switch bank 1
+  $7F00 - $7F0E       15B     VTAC            Video timing registers
+  $8000 - $88FF     2304B     CRTRAM          Character / video RAM
+  $E000 - $E7FF       2KB     ROM A           Plugin slot (swappable game/app ROM)
+  $E800 - $EFFF       2KB     ROM B           Firmware: init/reset, dispatch, serial ISR
+  $F000 - $F7FF       2KB     ROM C*          Firmware: parser, cursor, screen ops
+  $F800 - $FFFF       2KB     ROM D*          Firmware: char out, scroll, setup, vectors
+
+  MC-6800 interrupt vectors (top 8 bytes of ROM D, $FFF8-$FFFF):
+
+  VECTOR ADDR     NAME    TARGET      FUNCTION
+  ------------------------------------------------------------
+  $FFF8 / $FFF9   IRQ     -> $ED83    Serial/printer ISR (ACIA1 + PRNTER)
+  $FFFA / $FFFB   SWI     -> $E800    Cold boot fallback
+  $FFFC / $FFFD   NMI     -> $E800    Cold boot fallback
+  $FFFE / $FFFF   RST     -> $E800    Power-on RESET -> ROM B cold boot
+
+==========================================================================================================================

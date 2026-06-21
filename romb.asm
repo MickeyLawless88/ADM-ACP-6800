@@ -15,7 +15,7 @@
 ; Disassembled by Mickey W. Lawless
 ; =============================================================================
 
-        CPU     6800
+        
 
 ; --- Hardware registers (manual Table 4-1 chip selects) ---
 HALT             EQU     $7000
@@ -85,7 +85,7 @@ ZP_CE            EQU     $CE
 ZP_D2            EQU     $D2
 ZP_DB            EQU     $DB
 
-        *= $E800
+        ORG      $E800
 
         SEI                         ; $E800  0F
         STAA    VTAC_0E             ; $E801  B7 7F 0E
@@ -1095,3 +1095,4 @@ L_EFF6
         CMPA    ZP_45               ; $EFFD  91 45
 ; --- Trailing/unused byte ($EFFF-$EFFF) ---
         DB      $26                                 ; $EFFF  &
+        END

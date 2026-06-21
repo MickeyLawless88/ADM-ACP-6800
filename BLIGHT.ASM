@@ -1,6 +1,6 @@
 ; =============================================================================
 ; B L I G H T   --  ADM-31 plugin ROM ($E000-$E7FF)
-;
+; By: Mickey White Lawless
 ; PREMISE:
 ;   Ark-ship MERIDIAN, grow-deck 4.  A spore-blight is loose in the crop
 ;   trays and creeps to the next crops every cycle.  You pilot containment

@@ -9,7 +9,7 @@
 ; MONDEB patch: change SWI_VEC/NMI_VEC/RST_VEC EQUs at bottom of file
 ; =============================================================================
 
-        CPU     6800
+       
 
 ; --- Hardware ---
 HALT             EQU     $7000
@@ -119,7 +119,7 @@ ZP_D8            EQU     $D8
 ZP_D9            EQU     $D9
 ZP_DB            EQU     $DB
 
-        *= $F800
+        ORG      $F800
 
                  CLC                          ; $F800  0C
                  STAA    HALT                 ; $F801  B7 70 00
@@ -1117,8 +1117,11 @@ SWI_VEC          EQU     $E800   ; [PATCH for MONDEB: MONDEB SWIADR]
 NMI_VEC          EQU     $E800   ; [PATCH for MONDEB: MONDEB NMIADR]
 RST_VEC          EQU     $E800   ; [PATCH for MONDEB: MONDEB START=$E800]
 
-        *= $FFF8   ; anchor interrupt vector table
+        ORG      $FFF8   ; anchor interrupt vector table
                  DW      IRQ_VEC ; $FFF8-$FFF9  IRQ
                  DW      SWI_VEC ; $FFFA-$FFFB  SWI
                  DW      NMI_VEC ; $FFFC-$FFFD  NMI
                  DW      RST_VEC ; $FFFE-$FFFF  RST
+                END
+
+

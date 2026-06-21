@@ -1,0 +1,748 @@
+; =============================================================================
+; ADM-31  SPACE INVADERS  --  ROM A plugin slot ($E000-$E7FF)
+; 2KB, 2716 EPROM, socket U62
+;
+; Disassembled by Mickey W. Lawless
+; Assemble:  crasm -o spaceinvaders.scode spaceinvaders.asm
+; Binary:    python3 fix_spaceinvaders.py
+;
+; ENTRY POINTS:
+;   KEY_ENTRY ($E002) -- ROM67 IRQ handler calls here with keycode in A
+;   GAME_LOOP ($E03C) -- periodic game loop ticker (timer-driven)
+;
+; GAME FLOW:
+;   ROM67 polls plugin ROM, finds TJ, jumps $E000 -> LSRB/DECA (harmless)
+;   KEY_ENTRY: dispatches on keycode -> fire/move/abort
+;   GAME_LOOP: called periodically; reads joystick, runs GAME_TICK
+;   GAME_TICK: missile scan, invader movement, bullet advance, timers
+;   GAME_OVER: JMP ROMB_ENTRY -- returns to stock ADM-31 monitor
+;
+; SCREEN LAYOUT (CRTRAM):
+;   $8000-$8037  top border
+;   $8038-$803B  score digits (SHOW_SCORE writes here)
+;   $8140-$86DF  alien field (60 cols x 22 rows of 96-char cells)
+;   $86E0-$86FF  laser row
+;   $8700-$877F  bunker/wall row
+;
+; ZERO-PAGE VARIABLES:
+;   $01  GAME_FLAGS
+;   $0E  SHOOT_DIR
+;   $0F  KEY_ROW0
+;   $10  KEY_ROW1
+;   $50  JOY_STATE
+;   $51  JOY_PREV
+;   $65  PTR_TICK
+;   $6F  PTR_JOY
+;   $9E  GAME_MODE
+;   $9F  VEC_TMP
+;   $A0  VEC_TMP2
+;   $B1  BLIT_DST
+;   $B3  BLIT_SRC
+;   $C5  COL_STATE
+;   $EA  ALIEN_DIR
+;   $EB  ALIEN_TMR
+;   $EC  ALIEN_SPD
+;   $ED  WAVE_CNT
+;   $EE  WAVE_TMR
+;   $EF  LASER_POS
+;   $F1  ALIEN_START
+;   $F3  ALIEN_END
+;   $F5  SCORE_HI
+;   $F6  SCORE_LO
+;   $F7  BULLET_PTR
+;   $F9  COL_TMP
+;   $FB  MISSILE_FLG
+;
+; EXTERNAL CALLS:
+;   ROMC_F740 ($F740) -- blocking ACIA read, received char -> A
+;   ROMC_F6BB ($F6BB) -- BLITCPY: B bytes from [BLIT_SRC] to [BLIT_DST]
+;   ROMC_F03A ($F03A) -- ROM C serial transmit utility
+;   ROMC_F0DA ($F0DA) -- VSYNC strobe / frame sync
+;   ROMC_F313 ($F313) -- ROM C serial utility
+;   ROMB_ECC1 ($ECC1) -- ROM B keyboard scan / decode
+;   ROMB_ECBA ($ECBA) -- ROM B timer setup
+;   ROMB_ECF0 ($ECF0) -- ROM B sound/init
+;   ROMB_EF31 ($EF31) -- ROM B sound trigger
+;   ROMB_EFF6 ($EFF6) -- ROM B sound routine
+;   ROMD_FCF5 ($FCF5) -- ROM D utility (called 9x in SHOOT_SEQ/MOVE_LASER_FN)
+; =============================================================================
+
+        
+
+; --- Hardware addresses ---
+RAM_327D         EQU     $327D
+HALT             EQU     $7000
+HW_7720          EQU     $7720
+PIA1_DA          EQU     $7800
+SW_BNK3          EQU     $7D00
+SW_BNK1_E0       EQU     $7EE0
+SW_BNK1_EF       EQU     $7EEF
+VTAC             EQU     $7F00
+CRTRAM_38        EQU     $8038
+CRTRAM_39        EQU     $8039
+CRTRAM_3A        EQU     $803A
+CRTRAM_3B        EQU     $803B
+CRTRAM_160       EQU     $8160
+CRTRAM_186       EQU     $8186
+CRTRAM_603       EQU     $8603
+CRTRAM_605       EQU     $8605
+CRTRAM_620       EQU     $8620
+CRTRAM_654       EQU     $8654
+CRTRAM_6FF       EQU     $86FF
+CRTRAM_END       EQU     $8900
+CRTRAM_B01       EQU     $8B01
+CRTRAM_CE81      EQU     $CE81
+
+; --- External ROM entry points ---
+ROMB_ENTRY       EQU     $E800
+ROMB_E8D0        EQU     $E8D0
+ROMB_ECBA        EQU     $ECBA
+ROMB_ECC1        EQU     $ECC1
+ROMB_ECF0        EQU     $ECF0
+ROMB_EF31        EQU     $EF31
+ROMB_EFF6        EQU     $EFF6
+ROMC_F03A        EQU     $F03A
+ROMC_F0DA        EQU     $F0DA
+ROMC_F313        EQU     $F313
+ROMC_F6BB        EQU     $F6BB
+ROMC_F740        EQU     $F740
+ROMD_FCF5        EQU     $FCF5
+
+; --- Zero-page variable names ---
+GAME_FLAGS       EQU     $01
+SHOOT_DIR        EQU     $0E
+KEY_ROW0         EQU     $0F
+KEY_ROW1         EQU     $10
+JOY_STATE        EQU     $50
+JOY_PREV         EQU     $51
+PTR_TICK         EQU     $65
+PTR_JOY          EQU     $6F
+GAME_MODE        EQU     $9E
+VEC_TMP          EQU     $9F
+VEC_TMP2         EQU     $A0
+BLIT_DST         EQU     $B1
+BLIT_SRC         EQU     $B3
+COL_STATE        EQU     $C5
+ALIEN_DIR        EQU     $EA
+ALIEN_TMR        EQU     $EB
+ALIEN_SPD        EQU     $EC
+WAVE_CNT         EQU     $ED
+WAVE_TMR         EQU     $EE
+LASER_POS        EQU     $EF
+ALIEN_START      EQU     $F1
+ALIEN_END        EQU     $F3
+SCORE_HI         EQU     $F5
+SCORE_LO         EQU     $F6
+BULLET_PTR       EQU     $F7
+COL_TMP          EQU     $F9
+MISSILE_FLG      EQU     $FB
+
+
+; --- $E000-$E001: TJ plugin ID (ROM67 CPX #$544A check at $E8BE) ---
+        	 ORG	  $E000
+                 FCB      $54,$4A         ; TJ -- ROM selector signature bytes
+
+; =============================================================================
+; KEY_ENTRY -- called by ROM67 IRQ handler with decoded keycode in A.
+; Dispatches: fire=DO_FIRE, move=SET_JOYSTICK, A-key=PROC_AKEY
+; =============================================================================
+KEY_ENTRY        PSHA                             ; $E002  36
+                 JSR     ROMB_ECC1                ; $E003  BD EC C1
+                 PULA                             ; $E006  32
+                 CMPA    #$9F                     ; $E007  81 9F
+                 BEQ     DO_FIRE                  ; $E009  27 1B
+                 LDAB    GAME_FLAGS               ; $E00B  D6 01
+                 BITB    #$0A                     ; $E00D  C5 0A
+                 BNE     KEY_RTS                  ; $E00F  26 14
+                 CMPB    #$04                     ; $E011  C1 04
+                 BEQ     KEY_DISPATCH             ; $E013  27 1A
+                 CMPA    #$90                     ; $E015  81 90
+                 BEQ     SET_MOVE_FLAG            ; $E017  27 08
+                 LDAB    JOY_STATE                ; $E019  D6 50
+                 BITB    #$02                     ; $E01B  C5 02
+                 BEQ     KEY_RTS                  ; $E01D  27 06
+                 BRA     SET_JOYSTICK             ; $E01F  20 08
+SET_MOVE_FLAG    ORAB    #$04                     ; $E021  CA 04
+                 STAB    GAME_FLAGS               ; $E023  D7 01
+KEY_RTS          RTS                              ; $E025  39
+DO_FIRE          JMP     STATE_INIT               ; $E026  7E E0 AF
+SET_JOYSTICK     LDAB    GAME_FLAGS               ; $E029  D6 01
+                 ORAB    #$04                     ; $E02B  CA 04
+                 STAB    GAME_FLAGS               ; $E02D  D7 01
+KEY_DISPATCH     TSTA                             ; $E02F  4D
+                 BPL     JMP_SOUND                ; $E030  2A 07
+                 CLRB                             ; $E032  5F
+                 JSR     ROMB_ECF0                ; $E033  BD EC F0
+                 JMP     ROMB_EF31                ; $E036  7E EF 31
+JMP_SOUND        JMP     ROMB_EFF6                ; $E039  7E EF F6
+
+; =============================================================================
+; GAME_LOOP -- periodic game loop entry (timer-driven from ROM67).
+; Reads joystick via READ_JOY, then runs GAME_TICK each frame.
+; =============================================================================
+                 JMP     GAME_INIT                ; $E03C  7E E0 88
+                 PSHA                             ; $E03F  36
+                 JSR     ROMC_F740                ; $E040  BD F7 40
+                 PULA                             ; $E043  32
+                 CMPA    #$41                     ; $E044  81 41
+                 BEQ     PROC_AKEY                ; $E046  27 0F
+                 LDAB    GAME_MODE                ; $E048  D6 9E
+                 CMPB    #$01                     ; $E04A  C1 01
+                 BNE     PROC_RTS                 ; $E04C  26 2E
+                 CMPA    #$4D                     ; $E04E  81 4D
+                 BNE     PROC_RTS                 ; $E050  26 2A
+                 LDAB    #$06                     ; $E052  C6 06
+                 STAB    GAME_FLAGS               ; $E054  D7 01
+                 RTS                              ; $E056  39
+PROC_AKEY        LDAA    SW_BNK3                  ; $E057  B6 7D 00
+                 ANDA    #$7F                     ; $E05A  84 7F
+                 PSHA                             ; $E05C  36
+                 JSR     ROMC_F03A                ; $E05D  BD F0 3A
+                 PULA                             ; $E060  32
+                 JSR     ROMC_F03A                ; $E061  BD F0 3A
+                 JSR     ROMC_F313                ; $E064  BD F3 13
+                 BSR     ABORT_GAME               ; $E067  8D 14
+                 LDAA    JOY_STATE                ; $E069  96 50
+                 BITA    #$20                     ; $E06B  85 20
+                 BEQ     PROC_RTS                 ; $E06D  27 0D
+                 LDAA    KEY_ROW0                 ; $E06F  96 0F
+                 JSR     ROMC_F03A                ; $E071  BD F0 3A
+                 LDAA    KEY_ROW1                 ; $E074  96 10
+                 JSR     ROMC_F03A                ; $E076  BD F0 3A
+                 JSR     ROMC_F313                ; $E079  BD F3 13
+PROC_RTS         RTS                              ; $E07C  39
+
+; --- ABORT_GAME: clear state, pop return address, jump to ROM B reset ---
+ABORT_GAME       LDAA    SW_BNK3                  ; $E07D  B6 7D 00
+                 FCB      $7F,$00,$00              ; $E080  7F 00 00  (CLR $0000 -- DB forces EXT not DIR)
+                 PULA                             ; $E083  32
+                 PULA                             ; $E084  32
+                 JMP     ROMB_E8D0                ; $E085  7E E8 D0
+
+; =============================================================================
+; GAME_INIT -- full game initialisation.
+; Clears counters, fills screen with $98, blits alien template.
+; =============================================================================
+GAME_INIT        DB      $7F,$00,$F5              ; $E088  7F 00 F5  (CLR $00F5 -- DB forces EXT not DIR)
+                 FCB      $7F,$00,$F6              ; $E08B  7F 00 F6  (CLR $00F6 -- DB forces EXT not DIR)
+SCREEN_INIT      JSR     ROMC_F740                ; $E08E  BD F7 40
+                 LDAA    #$98                     ; $E091  86 98
+                 LDX     #$8000                   ; $E093  CE 80 00
+                 LDAB    #$18                     ; $E096  C6 18
+FILL_LOOP        STAA    $00,X                    ; $E098  A7 00
+                 JSR     DELAY_INX                ; $E09A  BD E3 6C
+                 DECB                             ; $E09D  5A
+                 BNE     FILL_LOOP                ; $E09E  26 F8
+                 LDX     #$E42B                   ; $E0A0  CE E4 2B
+                 STX     BLIT_SRC                 ; $E0A3  DF B3
+                 LDX     #$800A                   ; $E0A5  CE 80 0A
+                 STX     BLIT_DST                 ; $E0A8  DF B1
+                 LDAB    #$3C                     ; $E0AA  C6 3C
+                 JSR     ROMC_F6BB                ; $E0AC  BD F6 BB
+
+; =============================================================================
+; STATE_INIT -- initialise game state variables.
+; Sets up ALIEN_START/END ptrs, score, timers, laser pos, bullet ptr.
+; =============================================================================
+STATE_INIT       LDAA    #$03                     ; $E0AF  86 03
+                 STAA    WAVE_TMR                 ; $E0B1  97 EE
+                 JSR     SHOW_SCORE               ; $E0B3  BD E3 8C
+                 LDX     #$8140                   ; $E0B6  CE 81 40
+                 STX     ALIEN_START              ; $E0B9  DF F1
+                 LDX     #$85F0                   ; $E0BB  CE 85 F0
+                 STX     ALIEN_END                ; $E0BE  DF F3
+                 LDX     #$81EA                   ; $E0C0  CE 81 EA
+                 JSR     BLIT_FULL                ; $E0C3  BD E3 52
+                 LDX     #$828A                   ; $E0C6  CE 82 8A
+                 JSR     BLIT_FULL                ; $E0C9  BD E3 52
+                 LDX     #$832A                   ; $E0CC  CE 83 2A
+                 JSR     BLIT_FULL                ; $E0CF  BD E3 52
+                 LDX     #$83CA                   ; $E0D2  CE 83 CA
+                 JSR     BLIT_FULL                ; $E0D5  BD E3 52
+                 LDX     #$85FA                   ; $E0D8  CE 85 FA
+                 JSR     BLIT_HALF                ; $E0DB  BD E3 5F
+                 LDX     #$864A                   ; $E0DE  CE 86 4A
+                 JSR     BLIT_HALF                ; $E0E1  BD E3 5F
+                 LDX     #GAME_TICK               ; $E0E4  CE E3 19
+                 STX     PTR_JOY                  ; $E0E7  DF 6F
+                 LDX     #READ_JOY                ; $E0E9  CE E2 A4
+                 STX     PTR_TICK                 ; $E0EC  DF 65
+                 FCB      $7F,$00,$EA              ; $E0EE  7F 00 EA  (CLR $00EA -- DB forces EXT not DIR)
+                 LDAA    #$08                     ; $E0F1  86 08
+                 STAA    ALIEN_TMR                ; $E0F3  97 EB
+                 LDAA    #$05                     ; $E0F5  86 05
+                 STAA    ALIEN_SPD                ; $E0F7  97 EC
+                 LDX     #$86E2                   ; $E0F9  CE 86 E2
+                 STX     LASER_POS                ; $E0FC  DF EF
+                 JSR     MOVE_LASER_FN            ; $E0FE  BD E4 86
+                 LDAA    #$40                     ; $E101  86 40
+                 STAA    WAVE_CNT                 ; $E103  97 ED
+                 LDX     #ROMB_ENTRY              ; $E105  CE E8 00
+                 STX     BULLET_PTR               ; $E108  DF F7
+                 LDX     #$0005                   ; $E10A  CE 00 05
+                 JSR     ROMB_ECBA                ; $E10D  BD EC BA
+                 LDX     #$0000                   ; $E110  CE 00 00
+                 JSR     ROMB_ECBA                ; $E113  BD EC BA
+                 RTS                              ; $E116  39
+
+; --- SCAN_RIGHT: scan alien field rightward (ALIEN_START ptr in X) ---
+SCAN_RIGHT       LDX     ALIEN_START              ; $E117  DE F1
+SCAN_RIGHT_LP    STAA    HALT                     ; $E119  B7 70 00
+                 NOP                              ; $E11C  01
+                 LDAA    $00,X                    ; $E11D  A6 00
+                 TAB                              ; $E11F  16
+                 ANDB    #$FE                     ; $E120  C4 FE
+                 CMPB    #$60                     ; $E122  C1 60
+                 BNE     SCAN_RIGHT_NX            ; $E124  26 11
+                 EORA    #$01                     ; $E126  88 01
+                 STAA    HALT                     ; $E128  B7 70 00
+                 NOP                              ; $E12B  01
+                 STAA    $01,X                    ; $E12C  A7 01
+                 LDAA    #$20                     ; $E12E  86 20
+                 STAA    HALT                     ; $E130  B7 70 00
+                 NOP                              ; $E133  01
+                 STAA    $00,X                    ; $E134  A7 00
+                 INX                              ; $E136  08
+SCAN_RIGHT_NX    INX                              ; $E137  08
+                 CPX     ALIEN_END                ; $E138  9C F3
+                 BNE     SCAN_RIGHT_LP            ; $E13A  26 DD
+                 RTS                              ; $E13C  39
+
+; --- SCAN_LEFT: scan alien field leftward ---
+SCAN_LEFT        LDX     ALIEN_START              ; $E13D  DE F1
+SCAN_LEFT_LP     STAA    HALT                     ; $E13F  B7 70 00
+                 NOP                              ; $E142  01
+                 LDAA    $01,X                    ; $E143  A6 01
+                 TAB                              ; $E145  16
+                 ANDB    #$FE                     ; $E146  C4 FE
+                 CMPB    #$60                     ; $E148  C1 60
+                 BNE     SCAN_LEFT_NX             ; $E14A  26 11
+                 EORA    #$01                     ; $E14C  88 01
+                 STAA    HALT                     ; $E14E  B7 70 00
+                 NOP                              ; $E151  01
+                 STAA    $00,X                    ; $E152  A7 00
+                 LDAA    #$20                     ; $E154  86 20
+                 STAA    HALT                     ; $E156  B7 70 00
+                 NOP                              ; $E159  01
+                 STAA    $01,X                    ; $E15A  A7 01
+                 INX                              ; $E15C  08
+SCAN_LEFT_NX     INX                              ; $E15D  08
+                 CPX     ALIEN_END                ; $E15E  9C F3
+                 BNE     SCAN_LEFT_LP             ; $E160  26 DD
+                 RTS                              ; $E162  39
+
+; --- SCAN_COL: scan alien column vertically (ALIEN_END ptr in X) ---
+SCAN_COL         LDX     ALIEN_END                ; $E163  DE F3
+SCAN_COL_LP      STAA    HALT                     ; $E165  B7 70 00
+                 NOP                              ; $E168  01
+                 LDAA    $00,X                    ; $E169  A6 00
+                 TAB                              ; $E16B  16
+                 ANDB    #$FE                     ; $E16C  C4 FE
+                 CMPB    #$60                     ; $E16E  C1 60
+                 BNE     SCAN_COL_NX              ; $E170  26 21
+                 EORA    #$01                     ; $E172  88 01
+                 STAA    HALT                     ; $E174  B7 70 00
+                 NOP                              ; $E177  01
+                 STAA    $50,X                    ; $E178  A7 50
+                 LDAA    #$20                     ; $E17A  86 20
+                 STAA    HALT                     ; $E17C  B7 70 00
+                 NOP                              ; $E17F  01
+                 STAA    $00,X                    ; $E180  A7 00
+                 JSR     DELAY_INX                ; $E182  BD E3 6C
+                 STX     COL_TMP                  ; $E185  DF F9
+                 LDAA    COL_TMP                  ; $E187  96 F9
+                 CMPA    #$86                     ; $E189  81 86
+                 BNE     SCAN_COL_HIT             ; $E18B  26 03
+                 JMP     SHOOT_SEQ                ; $E18D  7E E4 73
+SCAN_COL_HIT     JSR     DELAY_DEX                ; $E190  BD E3 75
+SCAN_COL_NX      DEX                              ; $E193  09
+                 CPX     ALIEN_START              ; $E194  9C F1
+                 BNE     SCAN_COL_LP              ; $E196  26 CD
+                 LDX     ALIEN_START              ; $E198  DE F1
+                 JSR     DELAY_INX                ; $E19A  BD E3 6C
+                 STX     ALIEN_START              ; $E19D  DF F1
+                 RTS                              ; $E19F  39
+
+; --- MOVE_BULLET: advance bullet animation ptr through ROM B table ---
+MOVE_BULLET      LDX     BULLET_PTR               ; $E1A0  DE F7
+                 LDAB    $00,X                    ; $E1A2  E6 00
+                 INX                              ; $E1A4  08
+                 BNE     MOVE_BULLET2             ; $E1A5  26 03
+                 LDX     #ROMB_ENTRY              ; $E1A7  CE E8 00
+MOVE_BULLET2     STX     BULLET_PTR               ; $E1AA  DF F7
+                 ANDB    #$0F                     ; $E1AC  C4 0F
+                 LDX     ALIEN_END                ; $E1AE  DE F3
+BULLET_LP        STAA    HALT                     ; $E1B0  B7 70 00
+                 NOP                              ; $E1B3  01
+                 LDAA    $00,X                    ; $E1B4  A6 00
+                 ANDA    #$FE                     ; $E1B6  84 FE
+                 CMPA    #$60                     ; $E1B8  81 60
+                 BNE     BULLET_NX                ; $E1BA  26 0C
+                 DECB                             ; $E1BC  5A
+                 BNE     BULLET_NX                ; $E1BD  26 09
+                 LDAA    #$66                     ; $E1BF  86 66
+                 STAA    HALT                     ; $E1C1  B7 70 00
+                 NOP                              ; $E1C4  01
+                 STAA    $50,X                    ; $E1C5  A7 50
+                 RTS                              ; $E1C7  39
+BULLET_NX        DEX                              ; $E1C8  09
+                 CPX     ALIEN_START              ; $E1C9  9C F1
+                 BNE     BULLET_LP                ; $E1CB  26 E3
+                 RTS                              ; $E1CD  39
+
+; --- MOVE_INVADER: scan for $66 (bottom-row invader), move/erase ---
+MOVE_INVADER     LDX     #$877F                   ; $E1CE  CE 87 7F
+INVADER_LP       STAA    HALT                     ; $E1D1  B7 70 00
+                 NOP                              ; $E1D4  01
+                 LDAA    $00,X                    ; $E1D5  A6 00
+                 CMPA    #$66                     ; $E1D7  81 66
+                 BNE     INVADER_NX               ; $E1D9  26 5A
+                 STAA    HALT                     ; $E1DB  B7 70 00
+                 NOP                              ; $E1DE  01
+                 LDAB    $50,X                    ; $E1DF  E6 50
+                 CMPB    #$20                     ; $E1E1  C1 20
+                 BEQ     INVADER_ERASE            ; $E1E3  27 42
+                 LDAA    #$20                     ; $E1E5  86 20
+                 ANDB    #$FE                     ; $E1E7  C4 FE
+                 CMPB    #$60                     ; $E1E9  C1 60
+                 BNE     INVADER_CHK64            ; $E1EB  26 08
+                 FCB      $7A,$00,$ED              ; $E1ED  7A 00 ED  (DEC $00ED -- DB forces EXT not DIR)
+                 BNE     INVADER_CHK64            ; $E1F0  26 03
+                 JMP     SCREEN_INIT              ; $E1F2  7E E0 8E
+INVADER_CHK64    CMPB    #$64                     ; $E1F5  C1 64
+                 BNE     INVADER_ERASE            ; $E1F7  26 2E
+                 FCB      $7A,$00,$EE              ; $E1F9  7A 00 EE  (DEC $00EE -- DB forces EXT not DIR)
+                 BNE     INVADER_CLEAR            ; $E1FC  26 03
+                 JMP     SHOOT_SEQ                ; $E1FE  7E E4 73
+
+; --- INVADER_CLEAR: all invaders gone, clear screen, new wave ---
+INVADER_CLEAR    LDAA    #$20                     ; $E201  86 20
+                 LDX     #$86E1                   ; $E203  CE 86 E1
+CLEAR_LOOP       STAA    HALT                     ; $E206  B7 70 00
+                 NOP                              ; $E209  01
+                 STAA    $00,X                    ; $E20A  A7 00
+                 INX                              ; $E20C  08
+                 CPX     #$872E                   ; $E20D  8C 87 2E
+                 BNE     CLEAR_LOOP               ; $E210  26 F4
+                 LDAA    #$FF                     ; $E212  86 FF
+                 LDX     #$0000                   ; $E214  CE 00 00
+DELAY_LOOP       STAA    HALT                     ; $E217  B7 70 00
+                 NOP                              ; $E21A  01
+                 DEX                              ; $E21B  09
+                 BNE     DELAY_LOOP               ; $E21C  26 F9
+                 LDX     #$86E2                   ; $E21E  CE 86 E2
+                 STX     LASER_POS                ; $E221  DF EF
+                 JSR     MOVE_LASER_FN            ; $E223  BD E4 86
+                 RTS                              ; $E226  39
+INVADER_ERASE    STAA    HALT                     ; $E227  B7 70 00
+                 NOP                              ; $E22A  01
+                 STAA    $50,X                    ; $E22B  A7 50
+                 LDAA    #$20                     ; $E22D  86 20
+                 STAA    HALT                     ; $E22F  B7 70 00
+                 NOP                              ; $E232  01
+                 STAA    $00,X                    ; $E233  A7 00
+INVADER_NX       DEX                              ; $E235  09
+                 CPX     ALIEN_START              ; $E236  9C F1
+                 BNE     INVADER_LP               ; $E238  26 97
+                 LDX     #$8731                   ; $E23A  CE 87 31
+BLANK_ROW        LDAA    #$20                     ; $E23D  86 20
+                 STAA    HALT                     ; $E23F  B7 70 00
+                 NOP                              ; $E242  01
+                 STAA    $00,X                    ; $E243  A7 00
+                 INX                              ; $E245  08
+                 CPX     #$877F                   ; $E246  8C 87 7F
+                 BNE     BLANK_ROW                ; $E249  26 F2
+                 RTS                              ; $E24B  39
+
+; --- SCAN_MISSILE: scan alien field for $2A (missile hit marker) ---
+SCAN_MISSILE     LDX     #$8140                   ; $E24C  CE 81 40
+MISSILE_LP       STAA    HALT                     ; $E24F  B7 70 00
+                 NOP                              ; $E252  01
+                 LDAA    $50,X                    ; $E253  A6 50
+                 CMPA    #$2A                     ; $E255  81 2A
+                 BNE     MISSILE_NX               ; $E257  26 33
+                 STAA    HALT                     ; $E259  B7 70 00
+                 NOP                              ; $E25C  01
+                 LDAB    $00,X                    ; $E25D  E6 00
+                 CMPB    #$20                     ; $E25F  C1 20
+                 BEQ     MISSILE_CLR              ; $E261  27 1B
+                 LDAA    #$20                     ; $E263  86 20
+                 ANDB    #$FE                     ; $E265  C4 FE
+                 CMPB    #$60                     ; $E267  C1 60
+                 BNE     MISSILE_CLR              ; $E269  26 13
+                 FCB      $7A,$00,$ED              ; $E26B  7A 00 ED  (DEC $00ED -- DB forces EXT not DIR)
+                 PSHA                             ; $E26E  36
+                 JSR     ROMC_F0DA                ; $E26F  BD F0 DA
+                 JSR     INC_SCORE                ; $E272  BD E3 7E
+                 PULA                             ; $E275  32
+                 FCB      $7D,$00,$ED              ; $E276  7D 00 ED  (TST $00ED -- DB forces EXT not DIR)
+                 BNE     MISSILE_CLR              ; $E279  26 03
+                 JMP     SCREEN_INIT              ; $E27B  7E E0 8E
+MISSILE_CLR      STAA    HALT                     ; $E27E  B7 70 00
+                 NOP                              ; $E281  01
+                 STAA    $00,X                    ; $E282  A7 00
+                 LDAA    #$20                     ; $E284  86 20
+                 STAA    HALT                     ; $E286  B7 70 00
+                 NOP                              ; $E289  01
+                 STAA    $50,X                    ; $E28A  A7 50
+MISSILE_NX       INX                              ; $E28C  08
+                 CPX     #$86E0                   ; $E28D  8C 86 E0
+                 BNE     MISSILE_LP               ; $E290  26 BD
+                 LDX     #$8140                   ; $E292  CE 81 40
+MISSILE_DONE     LDAA    #$20                     ; $E295  86 20
+                 STAA    HALT                     ; $E297  B7 70 00
+                 NOP                              ; $E29A  01
+                 STAA    $00,X                    ; $E29B  A7 00
+                 INX                              ; $E29D  08
+                 CPX     #$818F                   ; $E29E  8C 81 8F
+                 BNE     MISSILE_DONE             ; $E2A1  26 F2
+                 RTS                              ; $E2A3  39
+
+; =============================================================================
+; READ_JOY -- read joystick/fire button state via PIA1 strobe.
+; Strobes PIA1_DA with scan codes, reads back; BMI=button pressed.
+; Dispatches to LASER_RIGHT, LASER_LEFT, FIRE_MISSILE, or GAME_OVER.
+; =============================================================================
+READ_JOY         LDAA    #$4B                     ; $E2A4  86 4B
+                 STAA    PIA1_DA                  ; $E2A6  B7 78 00
+                 LDAB    PIA1_DA                  ; $E2A9  F6 78 00
+                 BMI     FIRE_MISSILE             ; $E2AC  2B 50
+                 FCB      $7F,$00,$FB              ; $E2AE  7F 00 FB  (CLR $00FB -- DB forces EXT not DIR)
+                 LDAA    #$54                     ; $E2B1  86 54
+                 STAA    PIA1_DA                  ; $E2B3  B7 78 00
+                 LDAB    PIA1_DA                  ; $E2B6  F6 78 00
+                 BMI     LASER_RIGHT              ; $E2B9  2B 15
+                 LDAA    #$55                     ; $E2BB  86 55
+                 STAA    PIA1_DA                  ; $E2BD  B7 78 00
+                 LDAB    PIA1_DA                  ; $E2C0  F6 78 00
+                 BMI     LASER_LEFT               ; $E2C3  2B 22
+                 LDAA    #$4F                     ; $E2C5  86 4F
+                 STAA    PIA1_DA                  ; $E2C7  B7 78 00
+                 LDAB    PIA1_DA                  ; $E2CA  F6 78 00
+                 BMI     GAME_OVER                ; $E2CD  2B 46
+                 RTS                              ; $E2CF  39
+
+; --- LASER_RIGHT: move laser one cell rightward in CRTRAM ---
+LASER_RIGHT      LDX     LASER_POS                ; $E2D0  DE EF
+                 CPX     #$86E1                   ; $E2D2  8C 86 E1
+                 BEQ     JOY_RTS                  ; $E2D5  27 41
+                 LDAA    #$20                     ; $E2D7  86 20
+                 STAA    HALT                     ; $E2D9  B7 70 00
+                 NOP                              ; $E2DC  01
+                 STAA    $02,X                    ; $E2DD  A7 02
+                 DEX                              ; $E2DF  09
+                 STX     LASER_POS                ; $E2E0  DF EF
+                 JSR     MOVE_LASER_FN            ; $E2E2  BD E4 86
+                 BRA     JOY_RTS                  ; $E2E5  20 31
+
+; --- LASER_LEFT: move laser one cell leftward in CRTRAM ---
+LASER_LEFT       LDX     LASER_POS                ; $E2E7  DE EF
+                 CPX     #$872E                   ; $E2E9  8C 87 2E
+                 BEQ     JOY_RTS                  ; $E2EC  27 2A
+                 LDAA    #$20                     ; $E2EE  86 20
+                 STAA    HALT                     ; $E2F0  B7 70 00
+                 NOP                              ; $E2F3  01
+                 STAA    $00,X                    ; $E2F4  A7 00
+                 INX                              ; $E2F6  08
+                 STX     LASER_POS                ; $E2F7  DF EF
+                 JSR     MOVE_LASER_FN            ; $E2F9  BD E4 86
+                 BRA     JOY_RTS                  ; $E2FC  20 1A
+
+; --- FIRE_MISSILE: place $2A missile marker at current laser pos ---
+FIRE_MISSILE     DB      $7D,$00,$FB              ; $E2FE  7D 00 FB  (TST $00FB -- DB forces EXT not DIR)
+                 BNE     JOY_RTS                  ; $E301  26 15
+                 LDX     LASER_POS                ; $E303  DE EF
+                 JSR     DELAY_DEX                ; $E305  BD E3 75
+                 INX                              ; $E308  08
+                 LDAA    #$2A                     ; $E309  86 2A
+                 STAA    HALT                     ; $E30B  B7 70 00
+                 NOP                              ; $E30E  01
+                 STAA    $00,X                    ; $E30F  A7 00
+                 STAA    MISSILE_FLG              ; $E311  97 FB
+                 BRA     JOY_RTS                  ; $E313  20 03
+GAME_OVER        JMP     ROMB_ENTRY               ; $E315  7E E8 00
+JOY_RTS          RTS                              ; $E318  39
+
+; =============================================================================
+; GAME_TICK -- main per-frame game logic.
+; Order: SCAN_MISSILE -> MOVE_INVADER -> MOVE_BULLET -> alien timers
+; -> SCAN_RIGHT/LEFT/COL alien column movement.
+; =============================================================================
+GAME_TICK        JSR     SCAN_MISSILE             ; $E319  BD E2 4C
+                 JSR     MOVE_INVADER             ; $E31C  BD E1 CE
+                 JSR     MOVE_BULLET              ; $E31F  BD E1 A0
+                 FCB      $7A,$00,$EC              ; $E322  7A 00 EC  (DEC $00EC -- DB forces EXT not DIR)
+                 BEQ     TICK_ALIEN               ; $E325  27 02
+                 BRA     TICK_RTS                 ; $E327  20 28
+TICK_ALIEN       LDAA    #$0A                     ; $E329  86 0A
+                 STAA    ALIEN_SPD                ; $E32B  97 EC
+                 JSR     MOVE_BULLET              ; $E32D  BD E1 A0
+                 FCB      $7A,$00,$EB              ; $E330  7A 00 EB  (DEC $00EB -- DB forces EXT not DIR)
+                 BNE     TICK_DIR                 ; $E333  26 0F
+                 JSR     SCAN_COL                 ; $E335  BD E1 63
+                 LDAA    ALIEN_DIR                ; $E338  96 EA
+                 EORA    #$01                     ; $E33A  88 01
+                 STAA    ALIEN_DIR                ; $E33C  97 EA
+                 LDAA    #$10                     ; $E33E  86 10
+                 STAA    ALIEN_TMR                ; $E340  97 EB
+                 BRA     TICK_RTS                 ; $E342  20 0D
+TICK_DIR         DB      $7D,$00,$EA              ; $E344  7D 00 EA  (TST $00EA -- DB forces EXT not DIR)
+                 BEQ     TICK_LEFT                ; $E347  27 05
+                 JSR     SCAN_RIGHT               ; $E349  BD E1 17
+                 BRA     TICK_RTS                 ; $E34C  20 03
+TICK_LEFT        JSR     SCAN_LEFT                ; $E34E  BD E1 3D
+TICK_RTS         RTS                              ; $E351  39
+
+; --- BLIT_FULL: blit SCRN_ALIENS template to X (full alien field) ---
+BLIT_FULL        STX     BLIT_DST                 ; $E352  DF B1
+                 LDX     #$E3B3                   ; $E354  CE E3 B3
+                 STX     BLIT_SRC                 ; $E357  DF B3
+                 LDAB    #$3C                     ; $E359  C6 3C
+                 JSR     ROMC_F6BB                ; $E35B  BD F6 BB
+                 RTS                              ; $E35E  39
+
+; --- BLIT_HALF: blit SCRN_WALLS template to X (bunker row) ---
+BLIT_HALF        STX     BLIT_DST                 ; $E35F  DF B1
+                 LDX     #$E3EF                   ; $E361  CE E3 EF
+                 STX     BLIT_SRC                 ; $E364  DF B3
+                 LDAB    #$3C                     ; $E366  C6 3C
+                 JSR     ROMC_F6BB                ; $E368  BD F6 BB
+                 RTS                              ; $E36B  39
+
+; --- DELAY_INX: delay ~80 cycles then advance X by 1 ---
+DELAY_INX        PSHA                             ; $E36C  36
+                 LDAA    #$50                     ; $E36D  86 50
+DELAY_INX_LP     INX                              ; $E36F  08
+                 DECA                             ; $E370  4A
+                 BNE     DELAY_INX_LP             ; $E371  26 FC
+                 PULA                             ; $E373  32
+                 RTS                              ; $E374  39
+
+; --- DELAY_DEX: delay ~80 cycles then retreat X by 1 ---
+DELAY_DEX        PSHA                             ; $E375  36
+                 LDAA    #$50                     ; $E376  86 50
+DELAY_DEX_LP     DEX                              ; $E378  09
+                 DECA                             ; $E379  4A
+                 BNE     DELAY_DEX_LP             ; $E37A  26 FC
+                 PULA                             ; $E37C  32
+                 RTS                              ; $E37D  39
+
+; --- INC_SCORE: BCD-add 1 to SCORE_HI:SCORE_LO, update display ---
+INC_SCORE        LDAA    SCORE_LO                 ; $E37E  96 F6
+                 ADDA    #$01                     ; $E380  8B 01
+                 DAA                              ; $E382  19
+                 STAA    SCORE_LO                 ; $E383  97 F6
+                 LDAA    SCORE_HI                 ; $E385  96 F5
+                 ADCA    #$00                     ; $E387  89 00
+                 DAA                              ; $E389  19
+                 STAA    SCORE_HI                 ; $E38A  97 F5
+
+; --- SHOW_SCORE: write SCORE_HI:SCORE_LO digits to CRTRAM_38-3B ---
+SHOW_SCORE       LDAA    SCORE_LO                 ; $E38C  96 F6
+                 TAB                              ; $E38E  16
+                 LSRB                             ; $E38F  54
+                 LSRB                             ; $E390  54
+                 LSRB                             ; $E391  54
+                 LSRB                             ; $E392  54
+                 ANDA    #$0F                     ; $E393  84 0F
+                 ADDA    #$30                     ; $E395  8B 30
+                 ADDB    #$30                     ; $E397  CB 30
+                 STAA    CRTRAM_3B                ; $E399  B7 80 3B
+                 STAB    CRTRAM_3A                ; $E39C  F7 80 3A
+                 LDAA    SCORE_HI                 ; $E39F  96 F5
+                 TAB                              ; $E3A1  16
+                 LSRB                             ; $E3A2  54
+                 LSRB                             ; $E3A3  54
+                 LSRB                             ; $E3A4  54
+                 LSRB                             ; $E3A5  54
+                 ANDA    #$0F                     ; $E3A6  84 0F
+                 ADDA    #$30                     ; $E3A8  8B 30
+                 ADDB    #$30                     ; $E3AA  CB 30
+                 STAA    CRTRAM_39                ; $E3AC  B7 80 39
+                 STAB    CRTRAM_38                ; $E3AF  F7 80 38
+                 RTS                              ; $E3B2  39
+
+; =============================================================================
+; Screen template data ($E3B3-$E542)
+; SCRN_ALIENS: space ($20) and backtick ($60) chars -- alien field layout
+; SCRN_WALLS:  underscore ($5F) chars -- bunker/wall row layout
+; SCRN_TITLE:  ASCII title, score placeholder, GAME OVER text
+; SHOOT_SEQ:   inline code sequence for shoot animation
+; MOVE_LASER_FN: laser movement and collision detection code
+; =============================================================================
+SCRN_ALIENS      DB      $20,$20,$20,$20,$20,$20,$60,$20,$20,$60,$20,$20,$60,$20,$20,$60
+                 FCB      $20,$20,$60,$20,$20,$60,$20,$20,$60,$20,$20,$60,$20,$20,$60,$20
+                 FCB      $20,$60,$20,$20,$60,$20,$20,$60,$20,$20,$60,$20,$20,$60,$20,$20
+                 FCB      $60,$20,$20,$60,$20,$20,$20,$20,$20,$20,$20,$20
+SCRN_WALLS       DB      $5F,$5F,$5F,$5F,$5F,$5F,$5F,$5F,$20,$20,$20,$20,$5F,$5F,$5F,$5F
+                 FCB      $5F,$5F,$5F,$5F,$20,$20,$20,$20,$5F,$5F,$5F,$5F,$5F,$5F,$5F,$5F
+                 FCB      $20,$20,$20,$20,$5F,$5F,$5F,$5F,$5F,$5F,$5F,$5F,$20,$20,$20,$20
+                 FCB      $5F,$5F,$5F,$5F,$5F,$5F,$5F,$5F,$20,$20,$20,$20
+SCRN_TITLE       DB      $20,$20,$20,$20,$20,$20,$41,$44,$4D,$33,$31,$20,$20,$53,$50,$41
+                 FCB      $43,$45,$20,$49,$4E,$56,$41,$44,$45,$52,$53,$20,$20,$20,$20,$20
+                 FCB      $20,$20,$20,$20,$20,$20,$20,$20,$53,$43,$4F,$52,$45,$20,$30,$30
+                 FCB      $30,$30,$30,$20,$20,$20,$20,$20,$20,$20,$20,$20,$47,$41,$4D,$45
+                 FCB      $20,$20,$20,$20,$4F,$56,$45,$52
+SHOOT_SEQ        DB      $CE,$E4,$67,$DF,$B3,$CE,$81,$60,$DF,$B1,$C6,$0C,$BD,$F6,$BB,$BD
+                 FCB      $EC,$C1,$39
+MOVE_LASER_FN    DB      $DE,$EF,$86,$64,$B7,$70,$00,$01,$A7,$01,$86,$20,$B7,$70,$00,$01
+                 FCB      $A7,$00,$B7,$70,$00,$01,$A7,$02,$39,$FC,$F5,$86,$05,$BD,$FC,$F5
+                 FCB      $BD,$E5,$28,$39,$84,$1F,$BD,$FC,$F5,$BD,$E5,$28,$20,$D1,$D6,$50
+                 FCB      $C5,$01,$27,$20,$86,$01,$BD,$FC,$F5,$7F,$00,$0E,$B6,$7D,$00,$84
+                 FCB      $7F,$BD,$FC,$F5,$BD,$FC,$F5,$96,$51,$27,$13,$96,$0A,$8B,$30,$BD
+                 FCB      $FC,$F5,$20,$0A,$96,$C5,$2A,$06,$96,$4B,$97,$0E,$20,$0E,$86,$02
+                 FCB      $BD,$FC,$F5,$D6,$50,$C5,$01,$26,$03,$7F,$00,$0E,$96,$C5,$2A,$05
+                 FCB      $CE,$FA,$77,$20,$14,$CE,$FA,$32,$48,$DF,$9F,$9B,$A0,$97,$A0,$96
+                 FCB      $9F,$89,$00,$97,$9F,$DE,$9F,$EE,$00,$AD,$00,$7D,$00,$AE,$2A,$05
+                 FCB      $BD,$E0,$AF,$20,$0A,$86,$03,$BD,$FC,$F5,$96,$0E,$BD,$FC,$F5,$BD
+                 FCB      $EC,$C1,$CE,$00,$07,$BD,$EC,$BA,$39,$FF,$1B,$0D,$00,$1F,$00,$1C
+                 FCB      $01,$00,$20,$07,$00,$00,$00,$00,$02,$60,$16,$01,$01
+
+; =============================================================================
+; SPRITE_DATA ($E543-$E7FF) -- VTAC sprite pixel data + tail padding
+; Repeating pattern: $FF (blank cell) runs with $BF/$F7 pixel bytes.
+; =============================================================================
+SPRITE_DATA      DB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$BF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$F7,$FF,$FF,$FF,$FF,$FF
+                 FCB      $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF

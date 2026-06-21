@@ -1,0 +1,981 @@
+ASSEMBLY LISTING - SOURCE FILE BLIGHT.ASM
+
+ADDR  CODE        LINE  SOURCE STATEMENT
+----  ----------  ----  ----------------
+0000                  2  ; =============================================================================
+0000                  3  ; B L I G H T   --  ADM-31 plugin ROM ($E000-$E7FF)
+0000                  4  ;
+0000                  5  ; PREMISE:
+0000                  6  ;   Ark-ship MERIDIAN, grow-deck 4.  A spore-blight is loose in the crop
+0000                  7  ;   trays and creeps to the next crops every cycle.  You pilot containment
+0000                  8  ;   drone B-7.  Moving onto a tray SCORCHES it to bare deck -- a firebreak
+0000                  9  ;   the blight cannot cross.  Burn lines, starve the blight, save the harvest.
+0000                 10  ;
+0000                 11  ;   Cells:  Y crop (fuel)   * blight   x dead tray   . bare deck   @ drone
+0000                 12  ;   Each cycle the blight spreads one tray in each direction into adjacent
+0000                 13  ;   crops; spent blight burns out to dead (x).  Game ends when no blight
+0000                 14  ;   remains.  Score = crops still standing.
+0000                 15  ;
+0000                 16  ; Build/run:  assemble with acp6800 (pad 2048), load as --romA in adm31emu.
+0000                 17  ; =============================================================================
+0000                 18  
+0000  =7000        19  HALT            EQU     $7000           ; VSYNC strobe (write before CRTRAM)
+0000  =7800        20  PIA1            EQU     $7800           ; keyboard scan / strobe (bit7)
+0000  =7802        21  PIA1B           EQU     $7802           ; SHIFT(bit7)/CTRL(bit6)
+0000  =8000        22  CRTRAM          EQU     $8000           ; 80x24 display RAM
+0000  =EA1A        23  KBDTAB          EQU     $EA1A           ; firmware keycode table {unsh,sh}
+0000                 24  
+0000                 25  ; ---- zero page state ----
+0000                 26  
+0000                 27  SCRNPTR         RMB     2               ; CRTRAM write cursor
+0002                 28  CELLPTR         RMB     2               ; grid cell pointer
+0004                 29  KPTR            RMB     2               ; keytable pointer
+0006                 30  PSRC            RMB     2               ; PUTSTR source pointer
+0008                 31  SEED            RMB     2               ; LFSR rng state
+000A                 32  PX              RMB     1               ; drone column 0..7
+000B                 33  PY              RMB     1               ; drone row 0..7
+000C                 34  CYCLE           RMB     1
+000D                 35  TREES           RMB     1               ; living crops
+000E                 36  BURNED          RMB     1               ; dead trays
+000F                 37  FIRES           RMB     1               ; active blight cells
+0010                 38  CUTS            RMB     1               ; scorched (firebreaks burned)
+0011                 39  ROWV            RMB     1
+0012                 40  COLV            RMB     1
+0013                 41  NROW            RMB     1
+0014                 42  NCOL            RMB     1
+0015                 43  KSCAN           RMB     1
+0016                 44  KCHAR           RMB     1
+0017                 45  TMPA            RMB     1
+0018                 46  TMPB            RMB     1
+0019                 47  IDX             RMB     1
+001A                 48  QUITF           RMB     1
+001B                 49  MSGCODE         RMB     1
+001C                 50  DXX             RMB     1               ; move delta col (signed)
+001D                 51  DYY             RMB     1               ; move delta row (signed)
+001E                 52  
+001E  =0100        53  GRID            EQU     $0100           ; 64 bytes, page-aligned ($0100-$013F)
+001E                 54  
+001E                 55  ; cell codes: 0 bare  1 crop  2 blight  3 dead  4 ignite(temp)
+001E                 56  
+001E                 57  ; =============================================================================
+E000                 58          ORG     $E000
+E000  54 4A          59          FCB     $54,$4A                 ; "TJ" plugin signature
+E002                 60  
+E03C                 61          ORG     $E03C
+E03C  7E E0 3F       62          JMP     START
+E03F                 63  
+E03F                 64  ; =============================================================================
+E03F                 65  START
+E03F  0F             66          SEI                             ; own the machine
+E040  8E 03 FF       67          LDS     #$03FF
+E043  BD E3 94       68          JSR     TITLE                   ; premise screen + seed rng
+E046                 69  NEWGAME
+E046  BD E0 6C       70          JSR     INITGRID
+E049  7F 00 1A       71          CLR     QUITF
+E04C  7F 00 1B       72          CLR     MSGCODE
+E04F                 73  GLOOP
+E04F  BD E2 27       74          JSR     DRAW
+E052  BD E1 8D       75          JSR     GETCMD                  ; move/scorch, or set QUITF
+E055  96 1A          76          LDAA    QUITF
+E057  26 0A          77          BNE     GOVER
+E059  BD E1 00       78          JSR     SPREAD                  ; blight creeps one ring
+E05C  7C 00 0C       79          INC     CYCLE
+E05F  96 0F          80          LDAA    FIRES
+E061  26 EC          81          BNE     GLOOP                   ; blight remains -> keep playing
+E063                 82  GOVER
+E063  BD E2 27       83          JSR     DRAW                    ; final board
+E066  BD E3 37       84          JSR     ENDSCREEN
+E069  7E E0 46       85          JMP     NEWGAME
+E06C                 86  
+E06C                 87  ; =============================================================================
+E06C                 88  ; INITGRID - scatter crops via LFSR, seed blight at centre, place drone.
+E06C                 89  ; =============================================================================
+E06C                 90  INITGRID
+E06C  7F 00 19       91          CLR     IDX
+E06F                 92  IG1
+E06F  BD E0 BE       93          JSR     RAND                    ; A = pseudo-random byte
+E072  84 03          94          ANDA    #3
+E074  26 03          95          BNE     IGCROP                  ; 3/4 crop, 1/4 bare
+E076  4F             96          CLRA
+E077  20 02          97          BRA     IGSET
+E079                 98  IGCROP
+E079  86 01          99          LDAA    #1
+E07B                100  IGSET
+E07B  C6 01         101          LDAB    #$01
+E07D  D7 02         102          STAB    CELLPTR
+E07F  D6 19         103          LDAB    IDX
+E081  D7 03         104          STAB    CELLPTR+1
+E083  DE 02         105          LDX     CELLPTR
+E085  A7 00         106          STAA    0,X
+E087  7C 00 19      107          INC     IDX
+E08A  96 19         108          LDAA    IDX
+E08C  81 40         109          CMPA    #64
+E08E  26 DF         110          BNE     IG1
+E090                111  ; seed blight 2x2 at centre (rows 3-4, cols 3-4 -> idx 27,28,35,36)
+E090  86 02         112          LDAA    #2
+E092  CE 01 1B      113          LDX     #GRID+27
+E095  A7 00         114          STAA    0,X
+E097  CE 01 1C      115          LDX     #GRID+28
+E09A  A7 00         116          STAA    0,X
+E09C  CE 01 23      117          LDX     #GRID+35
+E09F  A7 00         118          STAA    0,X
+E0A1  CE 01 24      119          LDX     #GRID+36
+E0A4  A7 00         120          STAA    0,X
+E0A6                121  ; drone at (1,1); clear that tray
+E0A6  86 01         122          LDAA    #1
+E0A8  97 0A         123          STAA    PX
+E0AA  97 0B         124          STAA    PY
+E0AC  CE 01 09      125          LDX     #GRID+9
+E0AF  6F 00         126          CLR     0,X
+E0B1                127  ; counters
+E0B1  7F 00 0C      128          CLR     CYCLE
+E0B4  7F 00 0E      129          CLR     BURNED
+E0B7  7F 00 10      130          CLR     CUTS
+E0BA  BD E0 D8      131          JSR     RECNT                   ; set TREES, FIRES
+E0BD  39            132          RTS
+E0BE                133  
+E0BE                134  ; =============================================================================
+E0BE                135  ; RAND - 16-bit Galois LFSR (taps $B400).  Returns A=low byte. Clobbers A,TMPA.
+E0BE                136  ; =============================================================================
+E0BE                137  RAND
+E0BE  96 09         138          LDAA    SEED+1
+E0C0  84 01         139          ANDA    #1
+E0C2  97 17         140          STAA    TMPA                    ; out bit
+E0C4  74 00 08      141          LSR     SEED
+E0C7  76 00 09      142          ROR     SEED+1
+E0CA  7D 00 17      143          TST     TMPA
+E0CD  27 06         144          BEQ     RNDX
+E0CF  96 08         145          LDAA    SEED
+E0D1  88 B4         146          EORA    #$B4
+E0D3  97 08         147          STAA    SEED
+E0D5                148  RNDX
+E0D5  96 09         149          LDAA    SEED+1
+E0D7  39            150          RTS
+E0D8                151  
+E0D8                152  ; =============================================================================
+E0D8                153  ; RECNT - recount FIRES (blight) and TREES (crops) across the grid.
+E0D8                154  ; =============================================================================
+E0D8                155  RECNT
+E0D8  7F 00 0F      156          CLR     FIRES
+E0DB  7F 00 0D      157          CLR     TREES
+E0DE  C6 00         158          LDAB    #0
+E0E0                159  RC1
+E0E0  86 01         160          LDAA    #$01
+E0E2  97 02         161          STAA    CELLPTR
+E0E4  D7 03         162          STAB    CELLPTR+1
+E0E6  DE 02         163          LDX     CELLPTR
+E0E8  A6 00         164          LDAA    0,X
+E0EA  81 02         165          CMPA    #2
+E0EC  26 05         166          BNE     RC2
+E0EE  7C 00 0F      167          INC     FIRES
+E0F1  20 07         168          BRA     RCN
+E0F3                169  RC2
+E0F3  81 01         170          CMPA    #1
+E0F5  26 03         171          BNE     RCN
+E0F7  7C 00 0D      172          INC     TREES
+E0FA                173  RCN
+E0FA  5C            174          INCB
+E0FB  C1 40         175          CMPB    #64
+E0FD  26 E1         176          BNE     RC1
+E0FF  39            177          RTS
+E100                178  
+E100                179  ; =============================================================================
+E100                180  ; SPREAD - blight creeps one ring; spent blight burns out.
+E100                181  ;   Phase A: every blight(2) marks adjacent crop(1) as ignite(4).
+E100                182  ;   Phase B: blight(2)->dead(3), ignite(4)->blight(2).  Then recount.
+E100                183  ; =============================================================================
+E100                184  SPREAD
+E100  C6 00         185          LDAB    #0                      ; B = index, preserved across IGNB
+E102                186  SPA
+E102  86 01         187          LDAA    #$01
+E104  97 02         188          STAA    CELLPTR
+E106  D7 03         189          STAB    CELLPTR+1
+E108  DE 02         190          LDX     CELLPTR
+E10A  A6 00         191          LDAA    0,X
+E10C  81 02         192          CMPA    #2
+E10E  26 3B         193          BNE     SPAN
+E110                194  ; compute row/col of this blight cell
+E110  17            195          TBA
+E111  84 07         196          ANDA    #7
+E113  97 12         197          STAA    COLV
+E115  17            198          TBA
+E116  44            199          LSRA
+E117  44            200          LSRA
+E118  44            201          LSRA
+E119  97 11         202          STAA    ROWV
+E11B                203  ; up
+E11B  7D 00 11      204          TST     ROWV
+E11E  27 07         205          BEQ     SPADN
+E120  37            206          PSHB
+E121  C0 08         207          SUBB    #8
+E123  BD E1 7A      208          JSR     IGNB
+E126  33            209          PULB
+E127                210  SPADN
+E127  96 11         211          LDAA    ROWV
+E129  81 07         212          CMPA    #7
+E12B  27 07         213          BEQ     SPALF
+E12D  37            214          PSHB
+E12E  CB 08         215          ADDB    #8
+E130  BD E1 7A      216          JSR     IGNB
+E133  33            217          PULB
+E134                218  SPALF
+E134  7D 00 12      219          TST     COLV
+E137  27 06         220          BEQ     SPART
+E139  37            221          PSHB
+E13A  5A            222          DECB
+E13B  BD E1 7A      223          JSR     IGNB
+E13E  33            224          PULB
+E13F                225  SPART
+E13F  96 12         226          LDAA    COLV
+E141  81 07         227          CMPA    #7
+E143  27 06         228          BEQ     SPAN
+E145  37            229          PSHB
+E146  5C            230          INCB
+E147  BD E1 7A      231          JSR     IGNB
+E14A  33            232          PULB
+E14B                233  SPAN
+E14B  5C            234          INCB
+E14C  C1 40         235          CMPB    #64
+E14E  26 B2         236          BNE     SPA
+E150                237  ; phase B
+E150  C6 00         238          LDAB    #0
+E152                239  SPB
+E152  86 01         240          LDAA    #$01
+E154  97 02         241          STAA    CELLPTR
+E156  D7 03         242          STAB    CELLPTR+1
+E158  DE 02         243          LDX     CELLPTR
+E15A  A6 00         244          LDAA    0,X
+E15C  81 02         245          CMPA    #2
+E15E  26 09         246          BNE     SPB1
+E160  86 03         247          LDAA    #3
+E162  A7 00         248          STAA    0,X
+E164  7C 00 0E      249          INC     BURNED
+E167  20 08         250          BRA     SPBN
+E169                251  SPB1
+E169  81 04         252          CMPA    #4
+E16B  26 04         253          BNE     SPBN
+E16D  86 02         254          LDAA    #2
+E16F  A7 00         255          STAA    0,X
+E171                256  SPBN
+E171  5C            257          INCB
+E172  C1 40         258          CMPB    #64
+E174  26 DC         259          BNE     SPB
+E176  BD E0 D8      260          JSR     RECNT
+E179  39            261          RTS
+E17A                262  
+E17A                263  ; IGNB - if GRID[B]==crop(1) set it to ignite(4).  Clobbers A,X,CELLPTR.
+E17A                264  IGNB
+E17A  86 01         265          LDAA    #$01
+E17C  97 02         266          STAA    CELLPTR
+E17E  D7 03         267          STAB    CELLPTR+1
+E180  DE 02         268          LDX     CELLPTR
+E182  A6 00         269          LDAA    0,X
+E184  81 01         270          CMPA    #1
+E186  26 04         271          BNE     IGNBX
+E188  86 04         272          LDAA    #4
+E18A  A7 00         273          STAA    0,X
+E18C                274  IGNBX
+E18C  39            275          RTS
+E18D                276  
+E18D                277  ; =============================================================================
+E18D                278  ; GETCMD - read a command; move/scorch the drone, pass, or quit.
+E18D                279  ; =============================================================================
+E18D                280  GETCMD
+E18D                281  GCRD
+E18D  BD E4 A5      282          JSR     GETC                    ; A = ascii of pressed key
+E190  16            283          TAB                             ; keep raw in B (for space test)
+E191  84 DF         284          ANDA    #$DF                    ; fold letters to upper (n->N)
+E193  81 51         285          CMPA    #'Q
+E195  26 03         286          BNE     GCNQ
+E197  7E E2 22      287          JMP     GCQUIT
+E19A                288  GCNQ
+E19A  C1 20         289          CMPB    #$20                    ; space = wait
+E19C  27 7F         290          BEQ     GCPASS
+E19E  81 50         291          CMPA    #'P
+E1A0  27 7B         292          BEQ     GCPASS
+E1A2  81 4E         293          CMPA    #'N
+E1A4  26 09         294          BNE     GCS
+E1A6  7F 00 1C      295          CLR     DXX
+E1A9  86 FF         296          LDAA    #$FF
+E1AB  97 1D         297          STAA    DYY
+E1AD  20 25         298          BRA     GCTRY
+E1AF                299  GCS
+E1AF  81 53         300          CMPA    #'S
+E1B1  26 09         301          BNE     GCE
+E1B3  7F 00 1C      302          CLR     DXX
+E1B6  86 01         303          LDAA    #1
+E1B8  97 1D         304          STAA    DYY
+E1BA  20 18         305          BRA     GCTRY
+E1BC                306  GCE
+E1BC  81 45         307          CMPA    #'E
+E1BE  26 09         308          BNE     GCW
+E1C0  86 01         309          LDAA    #1
+E1C2  97 1C         310          STAA    DXX
+E1C4  7F 00 1D      311          CLR     DYY
+E1C7  20 0B         312          BRA     GCTRY
+E1C9                313  GCW
+E1C9  81 57         314          CMPA    #'W
+E1CB  26 C0         315          BNE     GCRD                    ; unknown key -> re-read
+E1CD  86 FF         316          LDAA    #$FF
+E1CF  97 1C         317          STAA    DXX
+E1D1  7F 00 1D      318          CLR     DYY
+E1D4                319  GCTRY
+E1D4  96 0B         320          LDAA    PY
+E1D6  9B 1D         321          ADDA    DYY
+E1D8  81 08         322          CMPA    #8
+E1DA  24 3A         323          BCC     GCBLK                   ; >=8 (or $FF) off-grid
+E1DC  97 13         324          STAA    NROW
+E1DE  96 0A         325          LDAA    PX
+E1E0  9B 1C         326          ADDA    DXX
+E1E2  81 08         327          CMPA    #8
+E1E4  24 30         328          BCC     GCBLK
+E1E6  97 14         329          STAA    NCOL
+E1E8  96 13         330          LDAA    NROW
+E1EA  97 11         331          STAA    ROWV
+E1EC  96 14         332          LDAA    NCOL
+E1EE  97 12         333          STAA    COLV
+E1F0  BD E4 23      334          JSR     CELLADDR
+E1F3  A6 00         335          LDAA    0,X
+E1F5  81 02         336          CMPA    #2                       ; blight -> can't enter
+E1F7  27 1D         337          BEQ     GCBLK
+E1F9  81 03         338          CMPA    #3                       ; dead -> can't enter
+E1FB  27 19         339          BEQ     GCBLK
+E1FD  81 01         340          CMPA    #1                       ; crop -> scorch costs a crop
+E1FF  26 06         341          BNE     GCMOVE
+E201  7A 00 0D      342          DEC     TREES
+E204  7C 00 10      343          INC     CUTS
+E207                344  GCMOVE
+E207  4F            345          CLRA
+E208  A7 00         346          STAA    0,X                      ; scorch tray to bare deck
+E20A  96 13         347          LDAA    NROW
+E20C  97 0B         348          STAA    PY
+E20E  96 14         349          LDAA    NCOL
+E210  97 0A         350          STAA    PX
+E212  7F 00 1B      351          CLR     MSGCODE
+E215  39            352          RTS
+E216                353  GCBLK
+E216  86 01         354          LDAA    #1
+E218  97 1B         355          STAA    MSGCODE
+E21A  7E E1 8D      356          JMP     GCRD                     ; blocked -> re-read (no wasted cycle)
+E21D                357  GCPASS
+E21D  86 02         358          LDAA    #2
+E21F  97 1B         359          STAA    MSGCODE
+E221  39            360          RTS
+E222                361  GCQUIT
+E222  86 01         362          LDAA    #1
+E224  97 1A         363          STAA    QUITF
+E226  39            364          RTS
+E227                365  
+E227                366  ; =============================================================================
+E227                367  ; DRAW - clear screen, draw title/grid/status/prompt.
+E227                368  ; =============================================================================
+E227                369  DRAW
+E227  BD E4 93      370          JSR     CLRSCRN
+E22A  86 00         371          LDAA    #0
+E22C  C6 19         372          LDAB    #25
+E22E  BD E4 4C      373          JSR     GOTOXY
+E231  CE E5 07      374          LDX     #SBANNER
+E234  BD E4 82      375          JSR     PUTSTR
+E237  86 02         376          LDAA    #2
+E239  C6 04         377          LDAB    #4
+E23B  BD E4 4C      378          JSR     GOTOXY
+E23E  CE E6 6C      379          LDX     #SHDR
+E241  BD E4 82      380          JSR     PUTSTR
+E244  7F 00 11      381          CLR     ROWV
+E247                382  DR1
+E247  96 11         383          LDAA    ROWV
+E249  8B 03         384          ADDA    #3
+E24B  C6 02         385          LDAB    #2
+E24D  BD E4 4C      386          JSR     GOTOXY
+E250  96 11         387          LDAA    ROWV
+E252  8B 31         388          ADDA    #'1
+E254  BD E4 72      389          JSR     PUTC                     ; row label digit
+E257  7F 00 12      390          CLR     COLV
+E25A                391  DR2
+E25A  86 20         392          LDAA    #$20
+E25C  BD E4 72      393          JSR     PUTC                     ; column gap
+E25F  96 0B         394          LDAA    PY
+E261  91 11         395          CMPA    ROWV
+E263  26 0D         396          BNE     DRCELL
+E265  96 0A         397          LDAA    PX
+E267  91 12         398          CMPA    COLV
+E269  26 07         399          BNE     DRCELL
+E26B  86 40         400          LDAA    #'@
+E26D  BD E4 72      401          JSR     PUTC                     ; drone here
+E270  20 0B         402          BRA     DRNX
+E272                403  DRCELL
+E272  BD E4 23      404          JSR     CELLADDR
+E275  A6 00         405          LDAA    0,X
+E277  BD E2 96      406          JSR     GLYPH
+E27A  BD E4 72      407          JSR     PUTC
+E27D                408  DRNX
+E27D  7C 00 12      409          INC     COLV
+E280  96 12         410          LDAA    COLV
+E282  81 08         411          CMPA    #8
+E284  26 D4         412          BNE     DR2
+E286  7C 00 11      413          INC     ROWV
+E289  96 11         414          LDAA    ROWV
+E28B  81 08         415          CMPA    #8
+E28D  26 B8         416          BNE     DR1
+E28F  BD E2 AE      417          JSR     DRAWSTAT
+E292  BD E3 09      418          JSR     DRAWMSG
+E295  39            419          RTS
+E296                420  
+E296                421  ; GLYPH - cell code in A -> display char in A.
+E296                422  GLYPH
+E296  81 01         423          CMPA    #1
+E298  26 03         424          BNE     GL2
+E29A  86 59         425          LDAA    #'Y
+E29C  39            426          RTS
+E29D                427  GL2
+E29D  81 02         428          CMPA    #2
+E29F  26 03         429          BNE     GL3
+E2A1  86 2A         430          LDAA    #'*
+E2A3  39            431          RTS
+E2A4                432  GL3
+E2A4  81 03         433          CMPA    #3
+E2A6  26 03         434          BNE     GL0
+E2A8  86 78         435          LDAA    #'x
+E2AA  39            436          RTS
+E2AB                437  GL0
+E2AB  86 2E         438          LDAA    #'.
+E2AD  39            439          RTS
+E2AE                440  
+E2AE                441  ; DRAWSTAT - the right-hand status panel.
+E2AE                442  DRAWSTAT
+E2AE  86 03         443          LDAA    #3
+E2B0  C6 28         444          LDAB    #40
+E2B2  BD E4 4C      445          JSR     GOTOXY
+E2B5  CE E6 7C      446          LDX     #SLCYC
+E2B8  BD E4 82      447          JSR     PUTSTR
+E2BB  96 0C         448          LDAA    CYCLE
+E2BD  BD E4 33      449          JSR     PRDEC2
+E2C0  86 04         450          LDAA    #4
+E2C2  C6 28         451          LDAB    #40
+E2C4  BD E4 4C      452          JSR     GOTOXY
+E2C7  CE E6 85      453          LDX     #SLCROP
+E2CA  BD E4 82      454          JSR     PUTSTR
+E2CD  96 0D         455          LDAA    TREES
+E2CF  BD E4 33      456          JSR     PRDEC2
+E2D2  86 05         457          LDAA    #5
+E2D4  C6 28         458          LDAB    #40
+E2D6  BD E4 4C      459          JSR     GOTOXY
+E2D9  CE E6 8E      460          LDX     #SLLOST
+E2DC  BD E4 82      461          JSR     PUTSTR
+E2DF  96 0E         462          LDAA    BURNED
+E2E1  BD E4 33      463          JSR     PRDEC2
+E2E4  86 06         464          LDAA    #6
+E2E6  C6 28         465          LDAB    #40
+E2E8  BD E4 4C      466          JSR     GOTOXY
+E2EB  CE E6 97      467          LDX     #SLBL
+E2EE  BD E4 82      468          JSR     PUTSTR
+E2F1  96 0F         469          LDAA    FIRES
+E2F3  BD E4 33      470          JSR     PRDEC2
+E2F6  86 07         471          LDAA    #7
+E2F8  C6 28         472          LDAB    #40
+E2FA  BD E4 4C      473          JSR     GOTOXY
+E2FD  CE E6 A0      474          LDX     #SLSC
+E300  BD E4 82      475          JSR     PUTSTR
+E303  96 10         476          LDAA    CUTS
+E305  BD E4 33      477          JSR     PRDEC2
+E308  39            478          RTS
+E309                479  
+E309                480  ; DRAWMSG - flavour line, event line, command prompt.
+E309                481  DRAWMSG
+E309  86 0B         482          LDAA    #11
+E30B  C6 02         483          LDAB    #2
+E30D  BD E4 4C      484          JSR     GOTOXY
+E310  CE E6 A9      485          LDX     #SFLAV
+E313  BD E4 82      486          JSR     PUTSTR
+E316  86 0C         487          LDAA    #12
+E318  C6 02         488          LDAB    #2
+E31A  BD E4 4C      489          JSR     GOTOXY
+E31D  96 1B         490          LDAA    MSGCODE
+E31F  81 02         491          CMPA    #2
+E321  26 06         492          BNE     DMP
+E323  CE E6 CD      493          LDX     #SHOLD
+E326  BD E4 82      494          JSR     PUTSTR
+E329                495  DMP
+E329  86 0E         496          LDAA    #14
+E32B  C6 02         497          LDAB    #2
+E32D  BD E4 4C      498          JSR     GOTOXY
+E330  CE E6 E3      499          LDX     #SPROMPT
+E333  BD E4 82      500          JSR     PUTSTR
+E336  39            501          RTS
+E337                502  
+E337                503  ; =============================================================================
+E337                504  ; ENDSCREEN - result + score + rank, wait for key.
+E337                505  ; =============================================================================
+E337                506  ENDSCREEN
+E337  86 10         507          LDAA    #16
+E339  C6 02         508          LDAB    #2
+E33B  BD E4 4C      509          JSR     GOTOXY
+E33E  96 1A         510          LDAA    QUITF
+E340  26 08         511          BNE     ESAB
+E342  CE E7 08      512          LDX     #SCONTN
+E345  BD E4 82      513          JSR     PUTSTR
+E348  20 06         514          BRA     ESSC
+E34A                515  ESAB
+E34A  CE E7 21      516          LDX     #SABORT
+E34D  BD E4 82      517          JSR     PUTSTR
+E350                518  ESSC
+E350  86 11         519          LDAA    #17
+E352  C6 02         520          LDAB    #2
+E354  BD E4 4C      521          JSR     GOTOXY
+E357  CE E7 39      522          LDX     #SCROPSV
+E35A  BD E4 82      523          JSR     PUTSTR
+E35D  96 0D         524          LDAA    TREES
+E35F  BD E4 33      525          JSR     PRDEC2
+E362  86 12         526          LDAA    #18
+E364  C6 02         527          LDAB    #2
+E366  BD E4 4C      528          JSR     GOTOXY
+E369  96 0D         529          LDAA    TREES
+E36B  81 1E         530          CMPA    #30
+E36D  25 05         531          BCS     ESR2
+E36F  CE E7 47      532          LDX     #SRANK1
+E372  20 0C         533          BRA     ESPR
+E374                534  ESR2
+E374  81 0F         535          CMPA    #15
+E376  25 05         536          BCS     ESR3
+E378  CE E7 6B      537          LDX     #SRANK2
+E37B  20 03         538          BRA     ESPR
+E37D                539  ESR3
+E37D  CE E7 95      540          LDX     #SRANK3
+E380                541  ESPR
+E380  BD E4 82      542          JSR     PUTSTR
+E383  86 14         543          LDAA    #20
+E385  C6 02         544          LDAB    #2
+E387  BD E4 4C      545          JSR     GOTOXY
+E38A  CE E7 B8      546          LDX     #SAGAIN
+E38D  BD E4 82      547          JSR     PUTSTR
+E390  BD E4 A5      548          JSR     GETC
+E393  39            549          RTS
+E394                550  
+E394                551  ; =============================================================================
+E394                552  ; TITLE - premise screen; seed the rng from how long the operator waits.
+E394                553  ; =============================================================================
+E394                554  TITLE
+E394  BD E4 93      555          JSR     CLRSCRN
+E397  86 01         556          LDAA    #1
+E399  C6 1C         557          LDAB    #28
+E39B  BD E4 4C      558          JSR     GOTOXY
+E39E  CE E4 F3      559          LDX     #STITLE
+E3A1  BD E4 82      560          JSR     PUTSTR
+E3A4  86 04         561          LDAA    #4
+E3A6  C6 04         562          LDAB    #4
+E3A8  BD E4 4C      563          JSR     GOTOXY
+E3AB  CE E5 2F      564          LDX     #SP1
+E3AE  BD E4 82      565          JSR     PUTSTR
+E3B1  86 06         566          LDAA    #6
+E3B3  C6 04         567          LDAB    #4
+E3B5  BD E4 4C      568          JSR     GOTOXY
+E3B8  CE E5 52      569          LDX     #SP2
+E3BB  BD E4 82      570          JSR     PUTSTR
+E3BE  86 07         571          LDAA    #7
+E3C0  C6 04         572          LDAB    #4
+E3C2  BD E4 4C      573          JSR     GOTOXY
+E3C5  CE E5 7D      574          LDX     #SP3
+E3C8  BD E4 82      575          JSR     PUTSTR
+E3CB  86 09         576          LDAA    #9
+E3CD  C6 04         577          LDAB    #4
+E3CF  BD E4 4C      578          JSR     GOTOXY
+E3D2  CE E5 A6      579          LDX     #SP4
+E3D5  BD E4 82      580          JSR     PUTSTR
+E3D8  86 0A         581          LDAA    #10
+E3DA  C6 04         582          LDAB    #4
+E3DC  BD E4 4C      583          JSR     GOTOXY
+E3DF  CE E5 D3      584          LDX     #SP5
+E3E2  BD E4 82      585          JSR     PUTSTR
+E3E5  86 0C         586          LDAA    #12
+E3E7  C6 04         587          LDAB    #4
+E3E9  BD E4 4C      588          JSR     GOTOXY
+E3EC  CE E6 04      589          LDX     #SP6
+E3EF  BD E4 82      590          JSR     PUTSTR
+E3F2  86 0E         591          LDAA    #14
+E3F4  C6 04         592          LDAB    #4
+E3F6  BD E4 4C      593          JSR     GOTOXY
+E3F9  CE E6 2B      594          LDX     #SLEGEND
+E3FC  BD E4 82      595          JSR     PUTSTR
+E3FF  86 11         596          LDAA    #17
+E401  C6 04         597          LDAB    #4
+E403  BD E4 4C      598          JSR     GOTOXY
+E406  CE E6 55      599          LDX     #SPK
+E409  BD E4 82      600          JSR     PUTSTR
+E40C                601  ; seed loop
+E40C  CE AC E1      602          LDX     #$ACE1
+E40F  DF 08         603          STX     SEED
+E411                604  TWAIT
+E411  7C 00 09      605          INC     SEED+1
+E414  26 03         606          BNE     TW2
+E416  7C 00 08      607          INC     SEED
+E419                608  TW2
+E419  BD E4 E0      609          JSR     ANYKEY
+E41C  4D            610          TSTA
+E41D  27 F2         611          BEQ     TWAIT
+E41F  BD E4 A5      612          JSR     GETC                    ; consume + debounce-release
+E422  39            613          RTS
+E423                614  
+E423                615  ; =============================================================================
+E423                616  ; CELLADDR - in: ROWV,COLV ; out: X = GRID + ROWV*8 + COLV. Clobbers A.
+E423                617  ; =============================================================================
+E423                618  CELLADDR
+E423  96 11         619          LDAA    ROWV
+E425  48            620          ASLA
+E426  48            621          ASLA
+E427  48            622          ASLA
+E428  9B 12         623          ADDA    COLV
+E42A  97 03         624          STAA    CELLPTR+1
+E42C  86 01         625          LDAA    #$01
+E42E  97 02         626          STAA    CELLPTR
+E430  DE 02         627          LDX     CELLPTR
+E432  39            628          RTS
+E433                629  
+E433                630  ; =============================================================================
+E433                631  ; PRDEC2 - print A (0..99) as two decimal digits.
+E433                632  ; =============================================================================
+E433                633  PRDEC2
+E433  C6 00         634          LDAB    #0
+E435                635  P2A
+E435  81 0A         636          CMPA    #10
+E437  25 05         637          BCS     P2B
+E439  80 0A         638          SUBA    #10
+E43B  5C            639          INCB
+E43C  20 F7         640          BRA     P2A
+E43E                641  P2B
+E43E  36            642          PSHA
+E43F  17            643          TBA
+E440  8B 30         644          ADDA    #'0
+E442  BD E4 72      645          JSR     PUTC
+E445  32            646          PULA
+E446  8B 30         647          ADDA    #'0
+E448  BD E4 72      648          JSR     PUTC
+E44B  39            649          RTS
+E44C                650  
+E44C                651  ; =============================================================================
+E44C                652  ; SCREEN I/O
+E44C                653  ; =============================================================================
+E44C                654  ; GOTOXY - A=row B=col -> SCRNPTR. Clobbers A,B,X,TMPA.
+E44C                655  GOTOXY
+E44C  D7 17         656          STAB    TMPA
+E44E  CE 80 00      657          LDX     #CRTRAM
+E451  DF 00         658          STX     SCRNPTR
+E453                659  GXY1
+E453  4D            660          TSTA
+E454  27 0F         661          BEQ     GXY2
+E456  D6 01         662          LDAB    SCRNPTR+1
+E458  CB 50         663          ADDB    #80
+E45A  D7 01         664          STAB    SCRNPTR+1
+E45C  D6 00         665          LDAB    SCRNPTR
+E45E  C9 00         666          ADCB    #0
+E460  D7 00         667          STAB    SCRNPTR
+E462  4A            668          DECA
+E463  20 EE         669          BRA     GXY1
+E465                670  GXY2
+E465  D6 01         671          LDAB    SCRNPTR+1
+E467  DB 17         672          ADDB    TMPA
+E469  D7 01         673          STAB    SCRNPTR+1
+E46B  D6 00         674          LDAB    SCRNPTR
+E46D  C9 00         675          ADCB    #0
+E46F  D7 00         676          STAB    SCRNPTR
+E471  39            677          RTS
+E472                678  
+E472                679  ; PUTC - write char A to SCRNPTR, advance. Clobbers A,X,TMPB.
+E472                680  PUTC
+E472  97 18         681          STAA    TMPB
+E474  B7 70 00      682          STAA    HALT
+E477  01            683          NOP
+E478  DE 00         684          LDX     SCRNPTR
+E47A  96 18         685          LDAA    TMPB
+E47C  A7 00         686          STAA    0,X
+E47E  08            687          INX
+E47F  DF 00         688          STX     SCRNPTR
+E481  39            689          RTS
+E482                690  
+E482                691  ; PUTSTR - print null-terminated string at X.
+E482                692  PUTSTR
+E482  DF 06         693          STX     PSRC
+E484                694  PS1
+E484  DE 06         695          LDX     PSRC
+E486  A6 00         696          LDAA    0,X
+E488  27 08         697          BEQ     PSX
+E48A  08            698          INX
+E48B  DF 06         699          STX     PSRC
+E48D  BD E4 72      700          JSR     PUTC
+E490  20 F2         701          BRA     PS1
+E492                702  PSX
+E492  39            703          RTS
+E493                704  
+E493                705  ; CLRSCRN - blank the visible 80x24.
+E493                706  CLRSCRN
+E493  CE 80 00      707          LDX     #CRTRAM
+E496                708  CLS1
+E496  86 20         709          LDAA    #$20
+E498  B7 70 00      710          STAA    HALT
+E49B  01            711          NOP
+E49C  A7 00         712          STAA    0,X
+E49E  08            713          INX
+E49F  8C 87 80      714          CPX     #CRTRAM+1920
+E4A2  26 F2         715          BNE     CLS1
+E4A4  39            716          RTS
+E4A5                717  
+E4A5                718  ; =============================================================================
+E4A5                719  ; KEYBOARD ($EA1A decode + release wait)
+E4A5                720  ; =============================================================================
+E4A5                721  ; GETC - block until a key, return ascii in A.
+E4A5                722  GETC
+E4A5                723  GC0
+E4A5  5F            724          CLRB
+E4A6                725  GC1
+E4A6  F7 78 00      726          STAB    PIA1
+E4A9  B6 78 00      727          LDAA    PIA1
+E4AC  2B 07         728          BMI     GCHIT
+E4AE  5C            729          INCB
+E4AF  C1 58         730          CMPB    #$58
+E4B1  26 F3         731          BNE     GC1
+E4B3  20 F0         732          BRA     GC0
+E4B5                733  GCHIT
+E4B5  D7 15         734          STAB    KSCAN
+E4B7  58            735          ASLB
+E4B8  B6 78 02      736          LDAA    PIA1B
+E4BB  2A 01         737          BPL     GCNS
+E4BD  5C            738          INCB
+E4BE                739  GCNS
+E4BE  CE EA 1A      740          LDX     #KBDTAB
+E4C1  DF 04         741          STX     KPTR
+E4C3  DB 05         742          ADDB    KPTR+1
+E4C5  D7 05         743          STAB    KPTR+1
+E4C7  96 04         744          LDAA    KPTR
+E4C9  89 00         745          ADCA    #0
+E4CB  97 04         746          STAA    KPTR
+E4CD  DE 04         747          LDX     KPTR
+E4CF  A6 00         748          LDAA    0,X
+E4D1  97 16         749          STAA    KCHAR
+E4D3  D6 15         750          LDAB    KSCAN
+E4D5                751  GCRL
+E4D5  F7 78 00      752          STAB    PIA1
+E4D8  B6 78 00      753          LDAA    PIA1
+E4DB  2B F8         754          BMI     GCRL
+E4DD  96 16         755          LDAA    KCHAR
+E4DF  39            756          RTS
+E4E0                757  
+E4E0                758  ; ANYKEY - A=$FF if any key is down, else 0.
+E4E0                759  ANYKEY
+E4E0  5F            760          CLRB
+E4E1                761  AK1
+E4E1  F7 78 00      762          STAB    PIA1
+E4E4  B6 78 00      763          LDAA    PIA1
+E4E7  2B 07         764          BMI     AKYES
+E4E9  5C            765          INCB
+E4EA  C1 58         766          CMPB    #$58
+E4EC  26 F3         767          BNE     AK1
+E4EE  4F            768          CLRA
+E4EF  39            769          RTS
+E4F0                770  AKYES
+E4F0  86 FF         771          LDAA    #$FF
+E4F2  39            772          RTS
+E4F3                773  
+E4F3                774  ; =============================================================================
+E4F3                775  ; TEXT
+E4F3                776  ; =============================================================================
+E4F3  2A 20 20 20   777  STITLE   FCC     "*   B L I G H T   *"
+E506  00            778           FCB     0
+E507  42 20 4C 20   779  SBANNER  FCC     "B L I G H T   ::   MERIDIAN GROW-DECK 4"
+E52E  00            780           FCB     0
+E52F  41 52 4B 2D   781  SP1      FCC     "ARK-SHIP MERIDIAN  --  GROW-DECK 4"
+E551  00            782           FCB     0
+E552  41 20 53 50   783  SP2      FCC     "A SPORE-BLIGHT IS LOOSE IN THE CROP TRAYS."
+E57C  00            784           FCB     0
+E57D  45 56 45 52   785  SP3      FCC     "EVERY CYCLE IT CREEPS TO THE NEXT CROPS."
+E5A5  00            786           FCB     0
+E5A6  50 49 4C 4F   787  SP4      FCC     "PILOT DRONE B-7.  MOVE ONTO A TRAY TO SCORCH"
+E5D2  00            788           FCB     0
+E5D3  49 54 20 54   789  SP5      FCC     "IT TO BARE DECK -- A LINE THE BLIGHT CANT CROSS."
+E603  00            790           FCB     0
+E604  53 50 45 4E   791  SP6      FCC     "SPEND A FEW CROPS TO SAVE THE HARVEST."
+E62A  00            792           FCB     0
+E62B  59 3D 43 52   793  SLEGEND  FCC     "Y=CROP  *=BLIGHT  x=DEAD  .=DECK  @=DRONE"
+E654  00            794           FCB     0
+E655  50 52 45 53   795  SPK      FCC     "PRESS ANY KEY TO BEGIN"
+E66B  00            796           FCB     0
+E66C  31 20 32 20   797  SHDR     FCC     "1 2 3 4 5 6 7 8"
+E67B  00            798           FCB     0
+E67C  43 59 43 4C   799  SLCYC    FCC     "CYCLE:  "
+E684  00            800           FCB     0
+E685  43 52 4F 50   801  SLCROP   FCC     "CROPS:  "
+E68D  00            802           FCB     0
+E68E  4C 4F 53 54   803  SLLOST   FCC     "LOST:   "
+E696  00            804           FCB     0
+E697  42 4C 49 47   805  SLBL     FCC     "BLIGHT: "
+E69F  00            806           FCB     0
+E6A0  53 43 4F 52   807  SLSC     FCC     "SCORCH: "
+E6A8  00            808           FCB     0
+E6A9  47 52 4F 57   809  SFLAV    FCC     "GROW-DECK 4  ::  CONTAINMENT ACTIVE"
+E6CC  00            810           FCB     0
+E6CD  44 52 4F 4E   811  SHOLD    FCC     "DRONE HOLDS POSITION."
+E6E2  00            812           FCB     0
+E6E3  4D 4F 56 45   813  SPROMPT  FCC     "MOVE N/E/S/W   SPC=WAIT   Q=ABORT ? "
+E707  00            814           FCB     0
+E708  2A 2A 2A 20   815  SCONTN   FCC     "*** BLIGHT CONTAINED ***"
+E720  00            816           FCB     0
+E721  2A 2A 2A 20   817  SABORT   FCC     "*** MISSION ABORTED ***"
+E738  00            818           FCB     0
+E739  43 52 4F 50   819  SCROPSV  FCC     "CROPS SAVED: "
+E746  00            820           FCB     0
+E747  48 41 52 56   821  SRANK1   FCC     "HARVEST SECURED -- WELL FLOWN, B-7."
+E76A  00            822           FCB     0
+E76B  50 41 52 54   823  SRANK2   FCC     "PARTIAL HARVEST -- THE DECK WILL RECOVER."
+E794  00            824           FCB     0
+E795  47 52 4F 57   825  SRANK3   FCC     "GROW-DECK LOST -- RATIONS ON HALF."
+E7B7  00            826           FCB     0
+E7B8  50 52 45 53   827  SAGAIN   FCC     "PRESS ANY KEY TO REPLANT."
+E7D1  00            828           FCB     0
+E7D2                829  
+E7FF                830          ORG     $E7FF
+E7FF  FF            831          FCB     $FF
+E800                832  
+E800                833  		END
+
+SYMBOL TABLE
+  HALT     7000
+  PIA1     7800
+  PIA1B    7802
+  CRTRAM   8000
+  KBDTAB   EA1A
+  SCRNPTR  0000
+  CELLPTR  0002
+  KPTR     0004
+  PSRC     0006
+  SEED     0008
+  PX       000A
+  PY       000B
+  CYCLE    000C
+  TREES    000D
+  BURNED   000E
+  FIRES    000F
+  CUTS     0010
+  ROWV     0011
+  COLV     0012
+  NROW     0013
+  NCOL     0014
+  KSCAN    0015
+  KCHAR    0016
+  TMPA     0017
+  TMPB     0018
+  IDX      0019
+  QUITF    001A
+  MSGCODE  001B
+  DXX      001C
+  DYY      001D
+  GRID     0100
+  START    E03F
+  NEWGAME  E046
+  GLOOP    E04F
+  GOVER    E063
+  INITGRID E06C
+  IG1      E06F
+  IGCROP   E079
+  IGSET    E07B
+  RAND     E0BE
+  RNDX     E0D5
+  RECNT    E0D8
+  RC1      E0E0
+  RC2      E0F3
+  RCN      E0FA
+  SPREAD   E100
+  SPA      E102
+  SPADN    E127
+  SPALF    E134
+  SPART    E13F
+  SPAN     E14B
+  SPB      E152
+  SPB1     E169
+  SPBN     E171
+  IGNB     E17A
+  IGNBX    E18C
+  GETCMD   E18D
+  GCRD     E18D
+  GCNQ     E19A
+  GCS      E1AF
+  GCE      E1BC
+  GCW      E1C9
+  GCTRY    E1D4
+  GCMOVE   E207
+  GCBLK    E216
+  GCPASS   E21D
+  GCQUIT   E222
+  DRAW     E227
+  DR1      E247
+  DR2      E25A
+  DRCELL   E272
+  DRNX     E27D
+  GLYPH    E296
+  GL2      E29D
+  GL3      E2A4
+  GL0      E2AB
+  DRAWSTAT E2AE
+  DRAWMSG  E309
+  DMP      E329
+  ENDSCREEN E337
+  ESAB     E34A
+  ESSC     E350
+  ESR2     E374
+  ESR3     E37D
+  ESPR     E380
+  TITLE    E394
+  TWAIT    E411
+  TW2      E419
+  CELLADDR E423
+  PRDEC2   E433
+  P2A      E435
+  P2B      E43E
+  GOTOXY   E44C
+  GXY1     E453
+  GXY2     E465
+  PUTC     E472
+  PUTSTR   E482
+  PS1      E484
+  PSX      E492
+  CLRSCRN  E493
+  CLS1     E496
+  GETC     E4A5
+  GC0      E4A5
+  GC1      E4A6
+  GCHIT    E4B5
+  GCNS     E4BE
+  GCRL     E4D5
+  ANYKEY   E4E0
+  AK1      E4E1
+  AKYES    E4F0
+  STITLE   E4F3
+  SBANNER  E507
+  SP1      E52F
+  SP2      E552
+  SP3      E57D
+  SP4      E5A6
+  SP5      E5D3
+  SP6      E604
+  SLEGEND  E62B
+  SPK      E655
+  SHDR     E66C
+  SLCYC    E67C
+  SLCROP   E685
+  SLLOST   E68E
+  SLBL     E697
+  SLSC     E6A0
+  SFLAV    E6A9
+  SHOLD    E6CD
+  SPROMPT  E6E3
+  SCONTN   E708
+  SABORT   E721
+  SCROPSV  E739
+  SRANK1   E747
+  SRANK2   E76B
+  SRANK3   E795
+  SAGAIN   E7B8
+
+====================================================================
+ASSEMBLY SUMMARY
+====================================================================
+TOTAL ERRORS: 0
+STATUS: ASSEMBLY SUCCESSFUL - NO ERRORS
+====================================================================

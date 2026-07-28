@@ -1,3 +1,166 @@
+# ACP Assembler — New Listing & Cross-Reference Features
+
+This note documents the features added to the ACP (Assembly Control Program)
+6800 assembler. It covers only the new behavior; the core assembly, S-record,
+and binary output are unchanged. Everything here builds clean under
+`gcc -ansi -pedantic -Wall -Wextra` and stays within the 64 KB-per-object
+limit for a 16-bit Turbo C build.
+
+## Summary
+
+Five things were added, in order:
+
+1. The assembly listing is kept within the terminal width instead of running
+   off the right edge.
+2. The listing columns are aligned from a single geometry, so headers, rules,
+   and data rows line up.
+3. A cross-reference (XREF) table is emitted after the symbol table.
+4. The symbol table prints five entries across, and the XREF gained symbol
+   kind and reference-count columns.
+5. The listing width is adjustable at run time from the ACP shell.
+
+## 1. Width-safe listing
+
+The assembly listing — both the terminal echo and the `.LST` file — is bounded
+to the effective listing width. When a source line is too long to fit, its text
+is clipped in the `SOURCE STATEMENT` field and marked with a trailing `>`; the
+address, object-code, and line-number columns are never touched, so those
+always remain readable and aligned.
+
+```
+ADDR  CODE          LINE  SOURCE STATEMENT
+----  ------------  ----  ----------------
+0000                   2  *THIS IS A VERY LONG FULL-LINE COMMENT MEANT TO OVER>
+C000  86 41            4  START   LDAA #$41            AND THIS TRAILING COMME>
+```
+
+## 2. Aligned listing columns
+
+Every listing row is produced from one fixed column geometry:
+
+```
+ADDR(4)  gap(2)  CODE(12)  gap(2)  LINE(4)  gap(2)  SOURCE
+```
+
+The header, the underline rule, and each data row are driven by matching
+format strings, so the labels sit exactly over their columns. The object-code
+field is pinned to 12 characters regardless of content (including `EQU` value
+rows, which previously used a narrower field and shifted the later columns
+left).
+
+## 3. Cross-reference (XREF) table
+
+After the symbol table the assembler prints a `CROSS-REFERENCE TABLE`: for
+every symbol, its kind, value, the line it was defined on, how many times it is
+referenced, and each line that references it. Symbols are listed
+alphabetically. A symbol that is defined but never used shows a count of `0`,
+which makes dead labels and unused equates easy to spot.
+
+```
+CROSS-REFERENCE TABLE
+SYMBOL          TYP  VAL   DEF     CNT  REFERENCES
+--------------  ---  ----  -----  ----  ----------------------------------
+BASE            EQU  8000  L5        1  L12
+BUFFER          MEM  C026  L23       0
+COUNT           EQU  0010  L3        1  L6
+LOOP            LAB  C002  L7        8  L8    L13   L15   L16   L17   L18
+                                        L19   L20
+TEMP            MEM  C025  L22       0
+```
+
+Columns:
+
+- `SYMBOL` — the label, up to 14 characters.
+- `TYP` — the symbol kind (see below).
+- `VAL` — the symbol's value or address, in hex.
+- `DEF` — the source line the symbol was defined on (`Lnnnn`).
+- `CNT` — the number of distinct lines that reference the symbol.
+- `REFERENCES` — the referencing lines, wrapped under this column when they do
+  not all fit on one physical line.
+
+Symbol kinds in the `TYP` column:
+
+- `LAB` — an address label (a code or initialized-data location).
+- `EQU` — an absolute constant defined with `EQU`.
+- `MEM` — reserved storage defined with `RMB` (i.e. a variable).
+
+References are collected during pass 2 as each operand expression is evaluated,
+so the table reflects exactly the symbols the assembler resolves. A symbol used
+more than once on the same line is counted once for that line.
+
+## 4. Five-column symbol table
+
+The `SYMBOL TABLE` prints up to five `NAME value` pairs per row instead of one
+per line, which keeps the section compact:
+
+```
+SYMBOL TABLE
+  COUNT    0010  DELAY    0005  BASE     8000  START    C000  LOOP     C002
+  WAIT     C007  COFFEE   C0FE  TEMP     C025  BUFFER   C026  STACK    C066
+```
+
+Names are shown in an 8-character field here; a longer name is clipped in this
+compact view but appears in full (up to 14 characters) in the XREF table. The
+number of columns drops automatically for narrow listing widths (see below), so
+a full row always fits.
+
+## 5. Adjustable listing width (ACP shell)
+
+The listing width is a run-time setting rather than a fixed 80 columns. The ACP
+menu now offers it as an option, and shows the current value:
+
+```
+'ACP' AT YOUR SERVICE - CHOOSE YOUR OPTION.
+=============================================================
+1    SOURCE FILE EDITOR.
+2    ASSEMBLE PROGRAM.
+3    SHOW THE ASSEMBLER OUTPUT FILE ON THE TERMINAL
+4    SET LISTING WIDTH   (NOW 79)
+5    END
+```
+
+Choosing option 4 prompts for the width:
+
+```
+LISTING WIDTH IS 79 COLUMNS.
+(72=TTY  80=CRT  132=PRINTER  0=UNLIMITED, RETURN=KEEP)
+...WIDTH ?
+```
+
+Behavior of the setting:
+
+- The width governs the source-statement clipping, the symbol-table column
+  count, and the XREF reference wrapping together, so the whole listing stays
+  within the chosen width.
+- `0` means unlimited: source lines print in full (well past 80 columns if that
+  is what the source contains), the XREF puts all references on one line, and
+  the symbol table stays at five across. Nothing is clipped.
+- A narrow width adapts everything down. At 72, for example, the symbol table
+  drops to four across, the source clips at column 72, and XREF references wrap
+  at five per line.
+- The minimum non-zero width is 50 columns (below that the XREF's fixed columns
+  and header no longer fit); `0` is always accepted.
+- The default is 79. The setting persists for the session across repeated
+  assemblies until it is changed.
+- Because the END option moved to make room, **END is now menu option 5** (it
+  was option 4). `BYE` still signs off as before.
+
+Typical values: `72` for a Teletype-style device, `80` for a CRT, `132` for a
+wide printer, `0` to keep full-fidelity output.
+
+## Notes and limitations
+
+- The width applies to both the terminal echo and the `.LST` file. With the
+  default 79 the file is identical to previous behavior; set `0` for full
+  fidelity in both.
+- The `END` directive's operand is not counted as a reference in the XREF,
+  because the assembler takes the start address from `ORG` and does not
+  evaluate the `END` operand. The table reflects what the assembler actually
+  resolves.
+- The XREF table is an addition beyond the original MICOS-hosted ACP toolchain;
+  it is not part of the historical listing format.
+
+
 ## Historical Background
 
 **Author:** Mickey White Lawless
